@@ -1,0 +1,736 @@
+"""
+لایه دیتابیس - مدیریت کاربران، واچ‌لیست و تاریخچه سیگنال‌ها
+از aiosqlite استفاده می‌کنیم چون ربات async هست
+"""
+import aiosqlite
+from datetime import datetime, timedelta
+from config import DB_PATH
+
+
+async def init_db():
+    """ساخت جداول در صورت عدم وجود"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                joined_at TEXT,
+                auto_scan_enabled INTEGER DEFAULT 1
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                symbol TEXT,
+                added_at TEXT,
+                UNIQUE(user_id, symbol)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS signal_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                signal_type TEXT,
+                score INTEGER,
+                price REAL,
+                created_at TEXT
+            )
+        """)
+        # کاربران مسدودشده توسط ادمین
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_users (
+                user_id INTEGER PRIMARY KEY,
+                reason TEXT,
+                blocked_at TEXT
+            )
+        """)
+        # تنظیمات مدیریت ریسک هر کاربر (برای محاسبه‌ی خودکار حجم پوزیشن)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_risk_settings (
+                user_id INTEGER PRIMARY KEY,
+                account_balance REAL,
+                risk_percent REAL,
+                updated_at TEXT
+            )
+        """)
+        # کاربران تاییدشده برای دسترسی به ربات - وقتی access_mode روی
+        # whitelist باشه، فقط این‌ها (و ادمین‌ها) می‌تونن از ربات استفاده کنن
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS whitelist_users (
+                user_id INTEGER PRIMARY KEY,
+                note TEXT,
+                added_at TEXT
+            )
+        """)
+        # درخواست‌های دسترسی در انتظار تایید ادمین - برای جلوگیری از
+        # اسپم نوتیفیکیشن (هر کاربر فقط یه‌بار توی این جدول ثبت می‌شه،
+        # حتی اگه چندبار /start بزنه، تا وقتی تایید/رد بشه)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS access_requests (
+                user_id INTEGER PRIMARY KEY,
+                requested_at TEXT
+            )
+        """)
+        # پایش عملکرد سیگنال‌های صادرشده از موتور تک‌تایم‌فریمی (برای /mystats)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS signal_performance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                symbol TEXT,
+                timeframe TEXT,
+                direction TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                status TEXT DEFAULT 'OPEN',
+                created_at TEXT,
+                closed_at TEXT
+            )
+        """)
+        # سیگنال‌هایی که منتظر تاییدیه‌ی کاربرن (بله/خیر پیگیری شه)؛ بعد
+        # از پاسخ کاربر، یا به signal_performance منتقل می‌شن یا حذف می‌شن
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                symbol TEXT,
+                timeframe TEXT,
+                direction TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                created_at TEXT
+            )
+        """)
+        # تنظیمات سراسری ربات (خوانده و نوشته‌شده هم از پنل وب، هم از کد)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_news_settings (
+                user_id INTEGER PRIMARY KEY,
+                enabled INTEGER DEFAULT 1,
+                auto_enabled INTEGER DEFAULT 0
+            )
+        """)
+        await db.commit()
+
+
+async def add_user(user_id: int, username: str) -> bool:
+    """
+    ثبت کاربر - اگه قبلاً وجود داشته باشه، فقط یوزرنیمش بروزرسانی می‌شه
+    (چون ممکنه کاربر یوزرنیمش رو عوض کرده باشه)، تاریخ عضویت اولیه‌ش
+    دست‌نخورده می‌مونه. خروجی: True اگه این اولین باری بود که این کاربر
+    دیده می‌شد (کاربر تازه)، False اگه از قبل وجود داشت.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+        is_new = await cursor.fetchone() is None
+        await db.execute(
+            """INSERT INTO users (user_id, username, joined_at) VALUES (?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET username=excluded.username""",
+            (user_id, username, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+        return is_new
+
+
+async def add_to_watchlist(user_id: int, symbol: str) -> bool:
+    """برمی‌گردونه True اگه با موفقیت اضافه شد"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO watchlist (user_id, symbol, added_at) VALUES (?, ?, ?)",
+                (user_id, symbol, datetime.utcnow().isoformat())
+            )
+            await db.commit()
+        return True
+    except aiosqlite.IntegrityError:
+        return False  # از قبل توی لیست بوده
+
+
+async def remove_from_watchlist(user_id: int, symbol: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM watchlist WHERE user_id = ? AND symbol = ?",
+            (user_id, symbol)
+        )
+        await db.commit()
+
+
+async def get_watchlist(user_id: int) -> list[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT symbol FROM watchlist WHERE user_id = ?", (user_id,)
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
+
+
+async def get_watchlist_count(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM watchlist WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def get_all_active_watch_pairs() -> list[tuple[int, str]]:
+    """همه‌ی جفت (user_id, symbol) کاربرانی که auto_scan فعاله"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT w.user_id, w.symbol
+            FROM watchlist w
+            JOIN users u ON u.user_id = w.user_id
+            WHERE u.auto_scan_enabled = 1
+        """)
+        return await cursor.fetchall()
+
+
+async def set_auto_scan(user_id: int, enabled: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET auto_scan_enabled = ? WHERE user_id = ?",
+            (1 if enabled else 0, user_id)
+        )
+        await db.commit()
+
+
+async def log_signal(symbol: str, signal_type: str, score: int, price: float):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO signal_history (symbol, signal_type, score, price, created_at) VALUES (?, ?, ?, ?, ?)",
+            (symbol, signal_type, score, price, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+
+
+async def get_last_signal(symbol: str) -> dict | None:
+    """آخرین سیگنال ثبت‌شده برای یه نماد - برای جلوگیری از اسپم سیگنال تکراری"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT signal_type, score, created_at FROM signal_history WHERE symbol = ? ORDER BY id DESC LIMIT 1",
+            (symbol,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return {"signal_type": row[0], "score": row[1], "created_at": row[2]}
+        return None
+
+
+# ==================== مدیریت کاربران مسدود (پنل ادمین) ====================
+
+async def block_user(user_id: int, reason: str = ""):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO blocked_users (user_id, reason, blocked_at) VALUES (?, ?, ?)",
+            (user_id, reason, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+
+
+async def unblock_user(user_id: int) -> bool:
+    """برمی‌گردونه True اگه واقعاً مسدود بوده و حذف شد"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM blocked_users WHERE user_id = ?", (user_id,))
+        existed = await cursor.fetchone() is not None
+        await db.execute("DELETE FROM blocked_users WHERE user_id = ?", (user_id,))
+        await db.commit()
+        return existed
+
+
+async def is_user_blocked(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM blocked_users WHERE user_id = ?", (user_id,))
+        return await cursor.fetchone() is not None
+
+
+async def get_blocked_users() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT user_id, reason, blocked_at FROM blocked_users ORDER BY blocked_at DESC"
+        )
+        rows = await cursor.fetchall()
+        return [{"user_id": r[0], "reason": r[1], "blocked_at": r[2]} for r in rows]
+
+
+# ==================== آمار کلی ربات (پنل ادمین) ====================
+
+async def get_bot_stats() -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        total_users = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
+        active_autoscan = (await (await db.execute(
+            "SELECT COUNT(*) FROM users WHERE auto_scan_enabled = 1"
+        )).fetchone())[0]
+        total_watchlist = (await (await db.execute("SELECT COUNT(*) FROM watchlist")).fetchone())[0]
+        total_blocked = (await (await db.execute("SELECT COUNT(*) FROM blocked_users")).fetchone())[0]
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        signals_today = (await (await db.execute(
+            "SELECT COUNT(*) FROM signal_history WHERE created_at LIKE ?", (f"{today}%",)
+        )).fetchone())[0]
+        return {
+            "total_users": total_users,
+            "active_autoscan": active_autoscan,
+            "total_watchlist": total_watchlist,
+            "total_blocked": total_blocked,
+            "signals_today": signals_today,
+        }
+
+
+async def get_all_user_ids() -> list[int]:
+    """برای ارسال پیام همگانی (broadcast)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT user_id FROM users")
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
+
+
+# ==================== تنظیمات مدیریت ریسک هر کاربر ====================
+
+async def set_user_risk(user_id: int, account_balance: float, risk_percent: float):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO user_risk_settings (user_id, account_balance, risk_percent, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   account_balance=excluded.account_balance,
+                   risk_percent=excluded.risk_percent,
+                   updated_at=excluded.updated_at""",
+            (user_id, account_balance, risk_percent, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+
+
+async def get_user_risk(user_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT account_balance, risk_percent FROM user_risk_settings WHERE user_id = ?",
+            (user_id,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return {"account_balance": row[0], "risk_percent": row[1]}
+        return None
+
+
+# ==================== پایش عملکرد سیگنال‌ها ====================
+
+async def record_signal_performance(user_id: int, symbol: str, timeframe: str, direction: str,
+                                     entry: float, sl: float, tps: list) -> int:
+    """ثبت یه سیگنال تازه‌صادرشده برای پایش بعدی؛ آی‌دی ردیف رو برمی‌گردونه"""
+    tp1 = tps[0] if len(tps) > 0 else None
+    tp2 = tps[1] if len(tps) > 1 else None
+    tp3 = tps[2] if len(tps) > 2 else None
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """INSERT INTO signal_performance
+               (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)""",
+            (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_open_signal_performances(limit: int = 200) -> list[dict]:
+    """
+    سیگنال‌هایی که هنوز به وضعیت نهایی (TP3 یا SL) نرسیدن - شامل سیگنال‌های
+    OPEN و همچنین اون‌هایی که فقط TP1/TP2 خوردن (چون هنوز ممکنه به سطح
+    بعدی برسن یا برگردن بخورن به SL، پس باید همچنان پایش بشن)
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT id, user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, status
+               FROM signal_performance
+               WHERE status NOT IN ('TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT')
+               ORDER BY id ASC LIMIT ?""",
+            (limit,)
+        )
+        rows = await cursor.fetchall()
+        cols = ["id", "user_id", "symbol", "timeframe", "direction", "entry", "sl", "tp1", "tp2", "tp3", "status"]
+        return [dict(zip(cols, r)) for r in rows]
+
+
+async def close_signal_performance(perf_id: int, status: str):
+    """برای وضعیت‌های نهایی (TP3_HIT یا SL_HIT یا BREAKEVEN_HIT) - closed_at رو هم ثبت می‌کنه"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE signal_performance SET status = ?, closed_at = ? WHERE id = ?",
+            (status, datetime.utcnow().isoformat(), perf_id)
+        )
+        await db.commit()
+
+
+async def update_signal_status(perf_id: int, status: str):
+    """برای وضعیت‌های میانی (TP1_HIT/TP2_HIT) - سیگنال هنوز باز می‌مونه، closed_at خالی می‌مونه"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE signal_performance SET status = ? WHERE id = ?",
+            (status, perf_id)
+        )
+        await db.commit()
+
+
+async def move_sl_to_breakeven(perf_id: int, entry: float):
+    """
+    بعد از رسیدن به TP1، حد ضرر رو به نقطه‌ی ورود (سربه‌سر) منتقل می‌کنه
+    تا ریسک این معامله از این لحظه به بعد صفر بشه. خود ستون status
+    دست‌نخورده می‌مونه (همون TP1_HIT)؛ فقط sl تغییر می‌کنه.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE signal_performance SET sl = ? WHERE id = ?",
+            (entry, perf_id)
+        )
+        await db.commit()
+
+
+async def get_user_performance_stats(user_id: int) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT status, COUNT(*) FROM signal_performance WHERE user_id = ? GROUP BY status",
+            (user_id,)
+        )
+        rows = await cursor.fetchall()
+        counts = {status: count for status, count in rows}
+        wins = counts.get("TP1_HIT", 0) + counts.get("TP2_HIT", 0) + counts.get("TP3_HIT", 0)
+        losses = counts.get("SL_HIT", 0)
+        breakeven = counts.get("BREAKEVEN_HIT", 0)
+        open_count = counts.get("OPEN", 0)
+        closed = wins + losses  # سربه‌سر نه برده حساب می‌شه نه باخته، پس توی نرخ برد نمیاد
+        win_rate = (wins / closed * 100) if closed > 0 else None
+        return {
+            "wins": wins, "losses": losses, "breakeven": breakeven, "open": open_count,
+            "closed": closed, "win_rate": win_rate, "breakdown": counts,
+        }
+
+
+async def get_user_open_signals(user_id: int) -> list[dict]:
+    """لیست سیگنال‌های فعال (باز یا TP1/TP2 خورده) این کاربر - برای /mysignals"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, status, created_at
+               FROM signal_performance
+               WHERE user_id = ? AND status NOT IN ('TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT')
+               ORDER BY id DESC""",
+            (user_id,)
+        )
+        rows = await cursor.fetchall()
+        cols = ["id", "symbol", "timeframe", "direction", "entry", "sl", "tp1", "tp2", "tp3", "status", "created_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+
+async def delete_signal_performance(perf_id: int, user_id: int) -> bool:
+    """حذف دستی یه سیگنال از پایش - فقط اگه واقعاً مال همون کاربر باشه. برمی‌گردونه True اگه حذف شد."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM signal_performance WHERE id = ? AND user_id = ?", (perf_id, user_id)
+        )
+        exists = await cursor.fetchone() is not None
+        if not exists:
+            return False
+        await db.execute("DELETE FROM signal_performance WHERE id = ? AND user_id = ?", (perf_id, user_id))
+        await db.commit()
+        return True
+
+
+# ==================== سیگنال‌های در انتظار تاییدیه‌ی کاربر ====================
+
+async def create_pending_signal(user_id: int, symbol: str, timeframe: str, direction: str,
+                                 entry: float, sl: float, tps: list) -> int:
+    """
+    قبل از ثبت قطعی یه سیگنال برای پایش، اول اینجا به‌صورت موقت ذخیره
+    می‌شه تا از کاربر تاییدیه گرفته بشه. آی‌دی ردیف رو برمی‌گردونه.
+    """
+    tp1 = tps[0] if len(tps) > 0 else None
+    tp2 = tps[1] if len(tps) > 1 else None
+    tp3 = tps[2] if len(tps) > 2 else None
+    async with aiosqlite.connect(DB_PATH) as db:
+        # پاکسازی سبک: pending‌های قدیمی همین کاربر (بیش از ۲۴ ساعت، یعنی
+        # جواب نداده) رو حذف کن تا جدول بی‌دلیل بزرگ نشه. مقایسه رو با
+        # timestamp پایتونی انجام می‌دیم (نه توابع تاریخ SQLite) چون
+        # فرمت isoformat پایتون با فرمت پیش‌فرض datetime() در SQLite یکی نیست.
+        cutoff = (datetime.utcnow() - timedelta(days=1)).isoformat()
+        await db.execute(
+            "DELETE FROM pending_signals WHERE user_id = ? AND created_at < ?",
+            (user_id, cutoff)
+        )
+        cursor = await db.execute(
+            """INSERT INTO pending_signals
+               (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_pending_signal(pending_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT id, user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3
+               FROM pending_signals WHERE id = ?""",
+            (pending_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        cols = ["id", "user_id", "symbol", "timeframe", "direction", "entry", "sl", "tp1", "tp2", "tp3"]
+        return dict(zip(cols, row))
+
+
+async def delete_pending_signal(pending_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM pending_signals WHERE id = ?", (pending_id,))
+        await db.commit()
+
+
+# ==================== تنظیمات سراسری (خوانده‌شده هم توسط ربات، هم پنل وب) ====================
+
+async def get_setting(key: str, default: str = None) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        return row[0] if row else default
+
+
+async def set_setting(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO bot_settings (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (key, str(value))
+        )
+        await db.commit()
+
+
+async def get_all_settings() -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT key, value FROM bot_settings")
+        rows = await cursor.fetchall()
+        return {k: v for k, v in rows}
+
+
+async def get_int_setting(key: str, default: int) -> int:
+    val = await get_setting(key)
+    try:
+        return int(val) if val is not None else default
+    except (ValueError, TypeError):
+        return default
+
+
+async def get_float_setting(key: str, default: float) -> float:
+    val = await get_setting(key)
+    try:
+        return float(val) if val is not None else default
+    except (ValueError, TypeError):
+        return default
+
+
+# ==================== لیست کاربران (برای پنل ادمین) ====================
+
+async def get_users_page(limit: int = 20, offset: int = 0) -> list[dict]:
+    """
+    لیست کاربران به ترتیب جدیدترین اول، به‌همراه وضعیت مسدود/لیست‌سفید
+    (با LEFT JOIN، بدون نیاز به چند کوئری جدا)
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT u.user_id, u.username, u.joined_at, u.auto_scan_enabled,
+                      CASE WHEN b.user_id IS NOT NULL THEN 1 ELSE 0 END AS is_blocked,
+                      CASE WHEN w.user_id IS NOT NULL THEN 1 ELSE 0 END AS is_whitelisted
+               FROM users u
+               LEFT JOIN blocked_users b ON b.user_id = u.user_id
+               LEFT JOIN whitelist_users w ON w.user_id = u.user_id
+               ORDER BY u.joined_at DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset)
+        )
+        rows = await cursor.fetchall()
+        cols = ["user_id", "username", "joined_at", "auto_scan_enabled", "is_blocked", "is_whitelisted"]
+        return [dict(zip(cols, r)) for r in rows]
+
+
+async def get_user_total_count() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM users")
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def find_user(user_id: int) -> dict | None:
+    """پروفایل کامل یه کاربر خاص - برای جستجوی تکی توسط ادمین"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT u.user_id, u.username, u.joined_at, u.auto_scan_enabled,
+                      CASE WHEN b.user_id IS NOT NULL THEN 1 ELSE 0 END AS is_blocked,
+                      b.reason,
+                      CASE WHEN w.user_id IS NOT NULL THEN 1 ELSE 0 END AS is_whitelisted
+               FROM users u
+               LEFT JOIN blocked_users b ON b.user_id = u.user_id
+               LEFT JOIN whitelist_users w ON w.user_id = u.user_id
+               WHERE u.user_id = ?""",
+            (user_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        cols = ["user_id", "username", "joined_at", "auto_scan_enabled", "is_blocked", "block_reason", "is_whitelisted"]
+        profile = dict(zip(cols, row))
+        profile["watchlist_count"] = await get_watchlist_count(user_id)
+        return profile
+
+
+# ==================== لیست سفید (whitelist) ====================
+
+async def add_to_whitelist(user_id: int, note: str = ""):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO whitelist_users (user_id, note, added_at) VALUES (?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET note=excluded.note""",
+            (user_id, note, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+
+
+async def remove_from_whitelist(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM whitelist_users WHERE user_id = ?", (user_id,))
+        existed = await cursor.fetchone() is not None
+        await db.execute("DELETE FROM whitelist_users WHERE user_id = ?", (user_id,))
+        await db.commit()
+        return existed
+
+
+async def is_whitelisted(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM whitelist_users WHERE user_id = ?", (user_id,))
+        return await cursor.fetchone() is not None
+
+
+async def get_whitelist() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT w.user_id, u.username, w.note, w.added_at
+               FROM whitelist_users w
+               LEFT JOIN users u ON u.user_id = w.user_id
+               ORDER BY w.added_at DESC"""
+        )
+        rows = await cursor.fetchall()
+        cols = ["user_id", "username", "note", "added_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+
+# ==================== درخواست‌های دسترسی در انتظار (برای نوتیفیکیشن ادمین) ====================
+
+async def create_access_request(user_id: int) -> bool:
+    """
+    ثبت درخواست دسترسی. خروجی True یعنی این اولین باریه که این کاربر
+    درخواست داده (پس باید به ادمین اطلاع بدیم)؛ False یعنی قبلاً درخواست
+    داده بود (چندبار /start زده) - نباید دوباره نوتیفای کنیم.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM access_requests WHERE user_id = ?", (user_id,))
+        already_exists = await cursor.fetchone() is not None
+        if already_exists:
+            return False
+        await db.execute(
+            "INSERT INTO access_requests (user_id, requested_at) VALUES (?, ?)",
+            (user_id, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+        return True
+
+
+async def delete_access_request(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM access_requests WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+
+async def get_access_requests() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT a.user_id, u.username, a.requested_at
+               FROM access_requests a
+               LEFT JOIN users u ON u.user_id = a.user_id
+               ORDER BY a.requested_at ASC"""
+        )
+        rows = await cursor.fetchall()
+        cols = ["user_id", "username", "requested_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+
+# ==================== تحلیل فراداده (Meta-Analytics) ====================
+
+async def get_resolved_signals(user_id: int = None) -> list[dict]:
+    """
+    همه‌ی سیگنال‌هایی که به یه نتیجه‌ی نهایی رسیدن (TP/SL/سربه‌سر) - پایه‌ی
+    تحلیل فراداده (کدوم تایم‌فریم/نماد/روز بهتر عمل کرده). اگه user_id
+    داده بشه فقط سیگنال‌های همون کاربر، وگرنه کل ربات (برای ادمین).
+    """
+    query = """SELECT symbol, timeframe, direction, status, created_at, closed_at
+               FROM signal_performance
+               WHERE status IN ('TP1_HIT', 'TP2_HIT', 'TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT')"""
+    params = ()
+    if user_id is not None:
+        query += " AND user_id = ?"
+        params = (user_id,)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+        cols = ["symbol", "timeframe", "direction", "status", "created_at", "closed_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+
+# ==================== تنظیمات اخبار هر کاربر ====================
+
+async def get_user_news_enabled(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT enabled FROM user_news_settings WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if row is None:
+            return True  # پیش‌فرض روشن
+        return bool(row[0])
+
+async def set_user_news_enabled(user_id: int, enabled: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO user_news_settings (user_id, enabled) VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled""",
+            (user_id, 1 if enabled else 0)
+        )
+        await db.commit()
+
+async def get_user_news_auto(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT auto_enabled FROM user_news_settings WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        if row is None:
+            return False
+        return bool(row[0])
+
+async def set_user_news_auto(user_id: int, enabled: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO user_news_settings (user_id, auto_enabled) VALUES (?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET auto_enabled=excluded.auto_enabled""",
+            (user_id, 1 if enabled else 0)
+        )
+        await db.commit()
+
+async def get_users_with_news_auto() -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT user_id FROM user_news_settings WHERE auto_enabled = 1")
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
