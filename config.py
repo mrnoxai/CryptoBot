@@ -142,3 +142,27 @@ BACKUP_DIR = os.getenv(
 BACKUP_INTERVAL_HOURS = float(os.getenv("BACKUP_INTERVAL_HOURS", "6"))
 BACKUP_INTERVAL_SECONDS = int(BACKUP_INTERVAL_HOURS * 3600)
 BACKUP_MAX_COUNT = int(os.getenv("BACKUP_MAX_COUNT", "14"))  # حداکثر تعداد بکاپ نگه‌داشته‌شده (رول می‌شه)
+
+# ---------- فاز ۱ تقویت موتور سیگنال: ADX + نوسان + هم‌نوایی زمینه‌ای ----------
+# این بخش برای بهبود دقت موتور /signal اضافه شد (بدون تغییر رفتار قبلی
+# در صورت غیرفعال‌بودن؛ فقط با اضافه‌شدن این مقادیر پیش‌فرض فعال می‌شه)
+
+# قدرت روند (ADX) - برای وزن‌دهی پویا به اندیکاتورهای روندی در برابر بازگشت‌به‌میانگین
+ADX_TREND_THRESHOLD = 25          # ADX بالاتر از این یعنی روند قویه (اندیکاتورهای روندی معتبرترن)
+ADX_RANGE_THRESHOLD = 18          # ADX پایین‌تر از این یعنی بازار رنج/بی‌رونده (RSI/بولینگر معتبرترن)
+ADX_TREND_WEIGHT_BOOST = 1.25     # ضریب افزایش وزن اندیکاتورهای روندی (EMA/SMA/MACD/OBV) در بازار پرروند
+ADX_TREND_WEIGHT_CUT = 0.7        # ضریب کاهش وزن همون اندیکاتورها در بازار رنج
+ADX_MEANREV_WEIGHT_BOOST = 1.4    # ضریب افزایش وزن RSI Zone/موقعیت بولینگر در بازار رنج
+ADX_MEANREV_WEIGHT_CUT = 0.6      # ضریب کاهش وزن همون‌ها در بازار پرروند
+
+# تطبیق آستانه‌ی صدور سیگنال با رژیم نوسان - در نوسان بالا/شدید سخت‌گیرتر می‌شیم
+VOLATILITY_THRESHOLD_HIGH_MULT = 1.15
+VOLATILITY_THRESHOLD_EXTREME_MULT = 1.3
+
+# هم‌نوایی زمینه‌ای (Context Confluence) - قبلاً این اطلاعات فقط نمایشی
+# بودن؛ حالا روی درصد اطمینان نهایی هم اثر می‌ذارن (نه روی جهت/SL/TP)
+CONTEXT_HTF_ALIGN_BONUS = 8        # پاداش اطمینان وقتی هم‌جهت با روند تایم‌فریم بالاتره
+CONTEXT_HTF_CONFLICT_PENALTY = 15  # جریمه‌ی اطمینان وقتی مخالف روند تایم‌فریم بالاتره
+CONTEXT_BTC_HIGH_CORR_PENALTY = 5  # جریمه‌ی اطمینان وقتی همبستگی با BTC خیلی بالاست (سیگنال مستقل نیست)
+CONTEXT_ORDERBOOK_BONUS = 5        # پاداش اطمینان وقتی فشار اردربوک هم‌جهته
+CONTEXT_ORDERBOOK_PENALTY = 8      # جریمه‌ی اطمینان وقتی فشار اردربوک مخالفه
