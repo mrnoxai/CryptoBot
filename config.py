@@ -173,3 +173,20 @@ CONTEXT_HISTORICAL_WIN_RATE_BONUS_THRESHOLD = 60
 CONTEXT_HISTORICAL_WIN_RATE_PENALTY_THRESHOLD = 40
 CONTEXT_HISTORICAL_PERFORMANCE_BONUS = 6
 CONTEXT_HISTORICAL_PERFORMANCE_PENALTY = 10
+
+# ---------- فاز ۲ تقویت موتور سیگنال: ادفام هم‌جهتی چندتایم‌فریمی ----------
+# علاوه بر تایم‌فریم بالاتر اول، یه تایم‌فریم حتی بالاتر (دومی) هم چک می‌شه
+# اگه سیگنال با هر دو هم‌جهت بود اطمینان بیشتر تقویت می‌شه، اگه با هر دو مخالف بود بیشتر جریمه می‌شه
+SECOND_HIGHER_TIMEFRAME_MAP = {
+    "1m": "1h",
+    "5m": "4h",
+    "15m": "4h",
+    "30m": "1d",
+    "1h": "1d",
+    "4h": "1w",
+    "1d": None,
+    "1w": None,
+}
+
+CONTEXT_MULTI_TF_FULL_ALIGN_BONUS = 6
+CONTEXT_MULTI_TF_FULL_CONFLICT_PENALTY = 10
