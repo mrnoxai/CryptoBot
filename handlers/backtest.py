@@ -1,12 +1,14 @@
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
 from exchange import ExchangeClient, normalize_symbol
 from backtest import (
-    run_backtest, run_walk_forward_backtest,
+    run_backtest, run_walk_forward_backtest, run_weight_calibration,
     DEFAULT_BACKTEST_CANDLES, MAX_BACKTEST_CANDLES, MIN_BACKTEST_CANDLES,
+    CALIBRATION_SEGMENTS, CALIBRATION_MIN_TRADES, CALIBRATION_STABILITY_PENALTY_WEIGHT,
 )
+from config import ADMIN_IDS, DEFAULT_SYMBOLS
 from single_analysis import TIMEFRAME_LABELS_FA
 from charts import generate_backtest_chart
 import database as db
@@ -125,11 +127,11 @@ def _format_walk_forward_message(results: list, symbol: str, timeframe: str) -> 
             if spread > 40:
                 lines.append(f"\n⚠️ اختلاف نرخ برد بین بازه‌ها زیاده ({spread:.0f} واحد درصد) — یعنی عملکرد این استراتژی روی این نماد/تایم‌فریم بین دوره‌های مختلف خیلی ناپایداره، احتمال overfitting یا وابستگی به شرایط خاص بازار وجود داره.")
             else:
-                lines.append(f"\n✅ نرخ برد بین بازه‌ها نسبتاً پایداره (اختلاف {spread:.0f} واحد درصد) — نشونه‌ی بهتری از پایداری استراتژیه.")
+                lines.append(f"\n✅ نرخ برد بین بازه‌ها نسبتاً پایداره (اختلاف {spread:.0f} واحد درصد) — نشونه‌ی بهتری از قایداری استراتژیه.")
 
     lines += [
         "",
-        "⚠️ هر بازه به‌اندازه‌ی دوره‌ی warmup از قبل خودش کندل قرض می‌گیره تا "
+        "⚠️ هر بازه به‌اندازه‌ی دوره‌ی warmup از قبل خودش کندل قرض می‌گیرد تا "
         "اندیکاتورهاش معتبر باشن؛ بازه‌ی اول این امکان رو نداره، پس ممکنه "
         "عملکردش کمی محافظه‌کارانه‌تر به‌نظر برسه. تعداد معاملات هر بازه "
         "کمتر از یه بک‌تست کامله (چون داده بین چند بخش تقسیم شده) - برای "
@@ -177,7 +179,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(df) < MIN_BACKTEST_CANDLES:
             await msg.edit_text(
                 f"⚠️ فقط {len(df)} کندل تاریخچه در دسترسه (حداقل {MIN_BACKTEST_CANDLES} تا لازمه). "
-                f"یه تایم‌فریم کوچیک‌تر یا نماد پرسابقه‌تر امتحان کن.",
+                f"یه تایم‌فریم کوچک‌تر یا نماد پرسابقه‌تر امتحان کن.",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -221,5 +223,160 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await msg.edit_text(f"❌ خطا در بک‌تست: {e}")
+    finally:
+        await client.close()
+
+
+# ==================== کالیبراسیون وزن‌ها (/calibrate) ====================
+
+CALIBRATION_DEFAULT_CANDLES = MAX_BACKTEST_CANDLES
+_KNOWN_TIMEFRAMES = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "3d", "1w"}
+
+
+def _fmt_calibration_value(value, suffix: str = "") -> str:
+    if value is None:
+        return "-"
+    return f"{value:.1f}{suffix}"
+
+
+def _format_calibration_message(candidates: list, symbols: list, timeframe: str) -> str:
+    tf_label = TIMEFRAME_LABELS_FA.get(timeframe, timeframe)
+    symbols_label = "، ".join(symbols)
+
+    reliable = [c for c in candidates if c.reliable]
+    unreliable = [c for c in candidates if not c.reliable]
+
+    lines = [
+        "🧪 *کالیبراسیون وزن‌ها (Walk-Forward)*",
+        f"نمادها: {symbols_label}",
+        f"تایم‌فریم: {tf_label}",
+        "",
+    ]
+
+    if not reliable:
+        lines.append(
+            f"⚠️ هیچ ترکیبی حداقل {CALIBRATION_MIN_TRADES} معامله‌ی جمع‌شده روی همه‌ی "
+            f"نمادها/بازه‌ها نداشت، پس نمی‌شه با اطمینان پیشنهادی داد. "
+            f"یه بازه‌ی زمانی/تعداد کندل بیشتر یا نمادهای بیشتر امتحان کن."
+        )
+    else:
+        lines.append("🏆 *بهترین ترکیب‌های قابل‌اتکا:*")
+        for i, c in enumerate(reliable[:5], 1):
+            wr = _fmt_calibration_value(c.win_rate, "%")
+            spread = _fmt_calibration_value(c.win_rate_spread, " واحد")
+            lines.append(
+                f"{i}. آستانه اطمینان={c.confidence_threshold_fraction:.2f} | "
+                f"ضریب ATR (SL)={c.atr_sl_mult:.1f} → "
+                f"{c.total_trades} معامله | برد {wr} | میانگین R: {c.avg_r:+.2f} | "
+                f"مجموع R: {c.total_r:+.2f} | اختلاف برد بین بازه‌ها: {spread} | "
+                f"امتیاز ترکیبی: {c.composite_score:+.2f}"
+            )
+
+    if unreliable:
+        lines.append(
+            "\nℹ️ " + str(len(unreliable)) +
+            f" ترکیب دیگه به‌خاطر تعداد معامله‌ی کم (کمتر از {CALIBRATION_MIN_TRADES}) "
+            "از رتبه‌بندی حذف شدن؛ آماری قابل‌اتکا ندارن."
+        )
+
+    lines.append("")
+    lines.append(
+        "📐 *امتیاز ترکیبی* = میانگین R − (اختلاف نرخ برد بین بازه‌ها ÷ ۱۰۰) × " +
+        f"{CALIBRATION_STABILITY_PENALTY_WEIGHT:.1f}" +
+        " — یعنی هم سودآوری رو در نظر می‌گیره هم پایداری بین بازه‌های مختلف رو "
+        "(مشابه هشدار ناپایداری خود بک‌تست پیشرو)."
+    )
+    lines.append("")
+    lines.append(
+        "⚠️ این فقط یه *گزارشه* — هیچ تنظیمی خودکار اعمال نمی‌شه. "
+        "برای اعمال یکی از ترکیب‌های بالا، روی دکمه‌ش بزن."
+    )
+    return "\n".join(lines)
+
+
+def _calibration_keyboard(candidates: list):
+    reliable = [c for c in candidates if c.reliable]
+    if not reliable:
+        return None
+    buttons = []
+    for c in reliable[:3]:
+        label = f"✅ اعمال ({c.confidence_threshold_fraction:.2f} / {c.atr_sl_mult:.1f})"
+        buttons.append([InlineKeyboardButton(
+            label, callback_data=f"applycal:{c.confidence_threshold_fraction:.2f}:{c.atr_sl_mult:.1f}"
+        )])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def calibrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    دستور ادمین‌محور برای کالیبراسیون آستانه‌ی اطمینان و ضریب ATR (SL)
+    با بک‌تست پیشرو، روی یک یا چند نماد. هیچ‌چیزی خودکار اعمال نمی‌شه؛
+    فقط گزارش + دکمه‌ی تایید نشون داده می‌شه.
+
+    استفاده: /calibrate [SYMBOL] [تایم‌فریم] [تعداد کندل]
+    بدون SYMBOL → روی چند نماد پیش‌فرض (config.DEFAULT_SYMBOLS) اجرا می‌شه
+    (پیشنهادی، چون این تنظیمات سراسری‌ان و روی همه‌ی کاربران/نمادها اثر می‌ذارن).
+    """
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔️ این دستور فقط برای ادمینه.")
+        return
+
+    args = list(context.args or [])
+    timeframe = "1h"
+    candles = CALIBRATION_DEFAULT_CANDLES
+    symbol_arg = None
+
+    for a in args:
+        if a.lower() in _KNOWN_TIMEFRAMES:
+            timeframe = a.lower()
+        elif a.isdigit():
+            candles = max(MIN_BACKTEST_CANDLES, min(MAX_BACKTEST_CANDLES, int(a)))
+        else:
+            symbol_arg = a
+
+    if symbol_arg:
+        symbols = [normalize_symbol(symbol_arg)]
+    else:
+        symbols = list(DEFAULT_SYMBOLS)
+
+    symbols_label = "، ".join(symbols)
+    msg = await update.message.reply_text(
+        f"⏳ در حال کالیبراسیون روی {symbols_label} — {TIMEFRAME_LABELS_FA.get(timeframe, timeframe)} "
+        f"با {candles} کندل تاریخی... (ممکنه یکی-دو دقیقه طول بکشه)"
+    )
+
+    client = ExchangeClient()
+    try:
+        symbol_dfs = []
+        skipped = []
+        for symbol in symbols:
+            try:
+                if not await client.validate_symbol(symbol):
+                    skipped.append(symbol)
+                    continue
+                df = await client.fetch_ohlcv_df(symbol, timeframe, limit=candles)
+                if len(df) < MIN_BACKTEST_CANDLES:
+                    skipped.append(symbol)
+                    continue
+                symbol_dfs.append((symbol, timeframe, df))
+            except Exception:
+                skipped.append(symbol)
+
+        if not symbol_dfs:
+            await msg.edit_text("❌ هیچ داده‌ی معتبری برای هیچ‌کدوم از نمادها پیدا نشد.")
+            return
+
+        candidates = run_weight_calibration(symbol_dfs, segments=CALIBRATION_SEGMENTS)
+        used_symbols = [s for s, _, _ in symbol_dfs]
+        text = _format_calibration_message(candidates, used_symbols, timeframe)
+        if skipped:
+            text = text + "\n\n(نمادهای رد شده به‌خاطر نبود داده‌ی کافی: " + "، ".join(skipped) + ")"
+
+        keyboard = _calibration_keyboard(candidates)
+        await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+
+    except Exception as e:
+        await msg.edit_text(f"❌ خطا در کالیبراسیون: {e}")
     finally:
         await client.close()
