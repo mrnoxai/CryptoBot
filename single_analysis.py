@@ -37,6 +37,12 @@
 - الگوهای کندلی بیشتری تشخیص داده می‌شن: ستاره‌ی صبح/عصر (Morning/Evening
   Star) و دوجی برگشتی، علاوه بر پوشا/چکش/ستاره‌ی تیرانداز قبلی.
 
+** فاز ۲ تقویت موتور (اضافه‌شده): **
+- واگرایی RSI/قیمت تعمیم داده شد به MACD Histogram و OBV هم (وزن 2 هر
+  کدوم، جدا از واگرایی RSI) - چون این دو اندیکاتور برخلاف RSI مقیاس ثابت
+  ۰-۱۰۰ ندارن، آستانه‌ی تشخیص به‌جای عدد مطلق، نسبی و بر پایه‌ی انحراف
+  معیار خود اندیکاتور توی بازه‌ی اخیره (MIN_DIVERGENCE_INDICATOR_GAP_STD_MULT).
+
 حد ضرر (SL): ترکیب ATR و آخرین Swing High/Low - هرکدوم منطقی‌تر و
 نزدیک‌تر به ساختار قیمت بود انتخاب می‌شه (نه صرفاً یه ضریب ثابت).
 
@@ -189,6 +195,7 @@ DIVERGENCE_LOOKBACK = 30
 PIVOT_WINDOW = 3  # تعداد کندل هر طرف برای تایید سقف/کف محلی
 MIN_RSI_DIVERGENCE_GAP = 5.0    # حداقل اختلاف RSI بین دو پیوت تا واگرایی معتبر باشه (فیلتر نویز)
 MIN_PRICE_MOVE_ATR_MULT = 0.5   # حداقل فاصله‌ی قیمتی بین دو پیوت (بر حسب ATR) تا معنادار باشه
+MIN_DIVERGENCE_INDICATOR_GAP_STD_MULT = 0.5  # حداقل اختلاف اندیکاتور (بر حسب انحراف معیار) برای واگرایی MACD/OBV - چون این‌ها برخلاف RSI مقیاس ثابت ۰-۱۰۰ ندارن
 
 
 def _find_pivots(series: pd.Series, window: int, find_highs: bool) -> list[int]:
@@ -244,6 +251,55 @@ def _detect_rsi_divergence(df: pd.DataFrame) -> dict | None:
             return {"type": "bearish", "bias": -1}
 
     return None
+
+
+def _detect_generic_indicator_divergence(df: pd.DataFrame, indicator_col: str) -> dict | None:
+    """
+    نسخه‌ی عمومی‌شده‌ی _detect_rsi_divergence برای اندیکاتورهایی مثل
+    MACD Histogram یا OBV که برخلاف RSI مقیاس ثابت ۰ تا ۱۰۰ ندارن. به‌جای
+    آستانه‌ی مطلق (MIN_RSI_DIVERGENCE_GAP)، از انحراف معیار خود اندیکاتور
+    توی بازه‌ی اخیر به‌عنوان آستانه‌ی نسبی استفاده می‌کنه.
+    """
+    recent = df.tail(DIVERGENCE_LOOKBACK).reset_index(drop=True)
+    if len(recent) < 2 * PIVOT_WINDOW + 5 or recent[indicator_col].isna().any():
+        return None
+
+    atr_val = float(df["atr"].iloc[-1]) if not pd.isna(df["atr"].iloc[-1]) else 0.0
+    min_price_gap = MIN_PRICE_MOVE_ATR_MULT * atr_val if atr_val > 0 else 0.0
+    indicator_std = float(recent[indicator_col].std())
+    min_indicator_gap = MIN_DIVERGENCE_INDICATOR_GAP_STD_MULT * indicator_std if indicator_std > 0 else 0.0
+
+    low_pivots = _find_pivots(recent["low"], PIVOT_WINDOW, find_highs=False)
+    if len(low_pivots) >= 2:
+        i_last = low_pivots[-1]
+        prior_candidates = low_pivots[:-1]
+        i_ref = min(prior_candidates, key=lambda i: recent["low"].iloc[i])
+        price_gap = recent["low"].iloc[i_ref] - recent["low"].iloc[i_last]
+        indicator_gap = recent[indicator_col].iloc[i_last] - recent[indicator_col].iloc[i_ref]
+        if price_gap > min_price_gap and indicator_gap > min_indicator_gap:
+            return {"type": "bullish", "bias": 1}
+
+    high_pivots = _find_pivots(recent["high"], PIVOT_WINDOW, find_highs=True)
+    if len(high_pivots) >= 2:
+        i_last = high_pivots[-1]
+        prior_candidates = high_pivots[:-1]
+        i_ref = max(prior_candidates, key=lambda i: recent["high"].iloc[i])
+        price_gap = recent["high"].iloc[i_last] - recent["high"].iloc[i_ref]
+        indicator_gap = recent[indicator_col].iloc[i_ref] - recent[indicator_col].iloc[i_last]
+        if price_gap > min_price_gap and indicator_gap > min_indicator_gap:
+            return {"type": "bearish", "bias": -1}
+
+    return None
+
+
+def _detect_macd_divergence(df: pd.DataFrame) -> dict | None:
+    """واگرایی بین MACD Histogram و قیمت (نسخه‌ی تعمیم‌یافته‌ی واگرایی RSI)"""
+    return _detect_generic_indicator_divergence(df, "macd_hist")
+
+
+def _detect_obv_divergence(df: pd.DataFrame) -> dict | None:
+    """واگرایی بین OBV و قیمت (نسخه‌ی تعمیم‌یافته‌ی واگرایی RSI)"""
+    return _detect_generic_indicator_divergence(df, "obv")
 
 
 # ---------- محاسبه‌ی نقطه‌ی ورود پیشنهادی (نه صرفاً قیمت لحظه‌ای) ----------
@@ -339,7 +395,7 @@ def _adx_adjusted_weight(base_weight: float, weight_category: str, adx_val: floa
     پرروند، اندیکاتورهای روندی (EMA/SMA/MACD/OBV) قابل‌اعتمادترن؛ توی
     بازار رنج/بی‌روند، اندیکاتورهای بازگشت‌به‌میانگین (RSI/بولینگر)
     قابل‌اعتمادترن. اندیکاتورهای مستقل (حجم/الگو/واگرایی) دست‌نخورده
-    می‌مونن - این‌ها فارغ از رژیم بازار معتبرن.
+    می‌مونن - این‌ها فارِف از رژیم بازار معتبرن.
 
     weight_category یه برچسب داخلیه، جدا از category نمایشی توی votes
     (که فقط برای گروه‌بندی متن دلایل استفاده می‌شه).
@@ -442,6 +498,8 @@ class SingleTFResult:
     reasons: list = field(default_factory=list)
     pattern: dict | None = None
     divergence: dict | None = None
+    macd_divergence: dict | None = None
+    obv_divergence: dict | None = None
     entry: float = 0.0
     entry_basis: str = None
     sl: float = None
@@ -477,7 +535,7 @@ def _classify_liquidity(quote_volume_24h: float) -> str:
         return "بالا 🟢"
     if quote_volume_24h >= 5_000_000:
         return "متوسط 🟡"
-    return "پایین 🔴 (ریسک اسپرد/لغزش قیمت بیشتر)"
+    return "پایین 🔴 (ریسک اسپرد/لقزش قیمت بیشتر)"
 
 
 DEFAULT_CONFIDENCE_THRESHOLD_FRACTION = 0.25  # حداقل فاصله‌ی امتیاز از صفر (نسبت به حداکثر) برای صدور سیگنال قطعی
@@ -597,6 +655,20 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
         else:
             votes.append((2, False, "", "🔀 واگرایی نزولی RSI/قیمت (سیگنال بازگشتی قوی)", "unique"))
 
+    macd_divergence = _detect_macd_divergence(df)
+    if macd_divergence:
+        if macd_divergence["bias"] > 0:
+            votes.append((2, True, "🔀 واگرایی صعودی MACD/قیمت (سیگنال بازگشتی قوی)", "", "unique"))
+        else:
+            votes.append((2, False, "", "🔀 واگرایی نزولی MACD/قیمت (سیگنال بازگشتی قوی)", "unique"))
+
+    obv_divergence = _detect_obv_divergence(df)
+    if obv_divergence:
+        if obv_divergence["bias"] > 0:
+            votes.append((2, True, "🔀 واگرایی صعودی OBV/قیمت (سیگنال بازگشتی قوی)", "", "unique"))
+        else:
+            votes.append((2, False, "", "🔀 واگرایی نزولی OBV/قیمت (سیگنال بازگشتی قوی)", "unique"))
+
     score = 0.0
     max_score = 0.0
     for weight, is_bull, bull_text, bear_text, category in votes:
@@ -670,6 +742,8 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
         reasons=reasons,
         pattern=pattern,
         divergence=divergence,
+        macd_divergence=macd_divergence,
+        obv_divergence=obv_divergence,
         entry=levels["entry"],
         entry_basis=levels["entry_basis"],
         sl=levels["sl"],
