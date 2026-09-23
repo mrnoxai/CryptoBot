@@ -48,6 +48,11 @@ ADMIN_HELP_TEXT = """
 `/removewelcome` — حذف پیام سفارشی (برگشت به حالت پیش‌فرض)
 `/getwelcome` — نمایش پیام فعلی
 
+*کالیبراسیون موتور:*
+`/calibrate [SYMBOL] [تایم‌فریم] [تعداد کندل]` — کالیبراسیون آستانه‌ی اطمینان و ضریب ATR (SL)
+با بک‌تست پیشرو (walk-forward) روی یک یا چند نماد — فقط گزارش می‌ده،
+هیچ‌چیزی خودکار اعمال نمی‌شه؛ برای اعمال باید روی دکمه‌ش بزنی.
+
 *عمومی:*
 `/stats` — آمار کلی ربات
 `/broadcast متن پیام` — ارسال پیام به همه‌ی کاربران ربات
@@ -140,7 +145,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def botanalytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    تحلیل فراداده‌ی کل ربات (بین همه‌ی کاربران) - چون نمونه‌ی آماری‌ش
+    تحلیل فراداده‌ی کل ربات (بین همه‌ی کاربران) - چون نمونه‌ی آماریش
     خیلی بزرگ‌تر از هر کاربر تنهاست، نتیجه‌گیری‌هاش قابل‌اتکاتره.
     """
     if not _is_admin(update.effective_user.id):
