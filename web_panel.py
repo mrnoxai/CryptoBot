@@ -1,8 +1,8 @@
 """
 پنل وب مدیریت ربات - بدون نیاز به دسترسی سرور یا ری‌دیپلوی
-همراه با خود ربات، توی همون پروسه، روی یه پورت جدا اجرا می‌شه.
-Railway به‌صورت خودکار این پورت رو تشخیص می‌ده و یه دامنه‌ی عمومی
-براش می‌سازه (چون از env variable مخصوص PORT استفاده می‌کنیم).
+hamrah ba khod robot, tooye hamoon proses, roo ye port joda ejra mishe.
+Railway be-soorat khodkar in port ro tashkhis mide o ye domain-e omoomi
+barash misaze (chon az env variable makhsoos PORT estefade mikonim).
 
 احراز هویت: HTTP Basic Auth ساده (username/password از .env)
 ⚠️ حتماً WEB_PANEL_PASSWORD رو یه مقدار قوی و غیرپیش‌فرض بذار، وگرنه
