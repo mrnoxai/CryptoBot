@@ -674,7 +674,7 @@ async def get_access_requests() -> list[dict]:
 
 async def get_resolved_signals(user_id: int = None) -> list[dict]:
     """
-    همه‌ی سیگنال‌هایی که به یه نتیجه‌ی نهایی رسیدن (TP/SL/سربه‌سر) - پایه‌ی
+    همه‌ی سیگنال‌هایی که به یه نتیجه‌ی نهایی (TP/SL/سربه‌سر) رسیدن - پایه‌ی
     تحلیل فراداده (کدوم تایم‌فریم/نماد/روز بهتر عمل کرده). اگه user_id
     داده بشه فقط سیگنال‌های همون کاربر، وگرنه کل ربات (برای ادمین).
     """
@@ -691,6 +691,22 @@ async def get_resolved_signals(user_id: int = None) -> list[dict]:
         rows = await cursor.fetchall()
         cols = ["symbol", "timeframe", "direction", "status", "created_at", "closed_at"]
         return [dict(zip(cols, r)) for r in rows]
+
+
+async def get_resolved_signals_for(symbol: str, timeframe: str, direction: str) -> list[dict]:
+    """
+    سیگنال‌های به‌نتیجه‌رسیده‌ی قبلی با همون نماد + تایم‌فریم + جهت دقیقاً - برای
+    فاز ۲ (یادگیری از تاریخچه‌ی عملکرد) - برمی‌گردونه لیستی از دیکشنری فقط شامل status.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """SELECT status FROM signal_performance
+               WHERE symbol = ? AND timeframe = ? AND direction = ?
+               AND status IN ('TP1_HIT', 'TP2_HIT', 'TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT')""",
+            (symbol, timeframe, direction)
+        )
+        rows = await cursor.fetchall()
+        return [{"status": r[0]} for r in rows]
 
 
 # ==================== تنظیمات اخبار هر کاربر ====================
