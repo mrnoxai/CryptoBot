@@ -85,6 +85,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "reject_access" and len(parts) == 2:
         await _handle_access_decision(query, context, int(parts[1]), approve=False)
 
+    elif action == "applycal" and len(parts) == 3:
+        await _handle_apply_calibration(query, parts[1], parts[2])
+
 
 async def _handle_access_decision(query, context, target_user_id: int, approve: bool):
     """
@@ -160,3 +163,31 @@ async def _handle_track_decision(query, pending_id: int, confirm: bool):
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_rows))
     except Exception:
         pass  # اگه پیام خیلی قدیمی بود و قابل ویرایش نبود، مهم نیست
+
+async def _handle_apply_calibration(query, conf_str: str, atr_str: str):
+    """
+    ادمین روی دکمه‌ی «✅ اعمال» زیر گزارش کالیبراسیون زده.
+    توجه: مثل _handle_access_decision، query.answer() همین الان توی
+    callback_router بالاتر صدا زده شده، پس اینجا دوباره answer نمی‌زنیم.
+    """
+    from config import ADMIN_IDS
+    if query.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        confidence_threshold_fraction = float(conf_str)
+        atr_sl_mult = float(atr_str)
+    except ValueError:
+        return
+
+    await db.set_setting("confidence_threshold_fraction", confidence_threshold_fraction)
+    await db.set_setting("atr_sl_mult", atr_sl_mult)
+
+    confirmation = (
+        "\n\n✅ اعمال شد: آستانه اطمینان=" + f"{confidence_threshold_fraction:.2f}" +
+        "، ضریب ATR (SL)=" + f"{atr_sl_mult:.1f}"
+    )
+    try:
+        await query.edit_message_text(query.message.text + confirmation)
+    except Exception:
+        pass
