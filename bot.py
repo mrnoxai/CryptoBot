@@ -20,7 +20,7 @@ from handlers.analysis import signal_command, chart_command, price_command, top_
 from handlers.watchlist import watch_command, unwatch_command, mywatchlist_command, autoscan_command
 from handlers.callbacks import callback_router
 from handlers.risk import setrisk_command, myrisk_command, mystats_command, mysignals_command, myanalytics_command
-from handlers.backtest import backtest_command
+from handlers.backtest import backtest_command, calibrate_command
 from handlers.news import news_command, news_settings_command, handle_news_callback
 from handlers.admin import (
     admin_help_command, block_command, unblock_command, blocklist_command,
@@ -109,6 +109,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("mysignals", mysignals_command))
     app.add_handler(CommandHandler("myanalytics", myanalytics_command))
     app.add_handler(CommandHandler("backtest", backtest_command))
+    app.add_handler(CommandHandler("calibrate", calibrate_command))
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("newssettings", news_settings_command))
 
