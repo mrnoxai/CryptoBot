@@ -3,7 +3,7 @@
 
 روش کار:
 هر اندیکاتور یه رأی وزن‌دار (bull/bear/neutral) میده. جمع امتیاز وزن‌دار
-جهت غالب رو مشخص می‌کنه و درصد اطمینان از نسبت |امتیاز کل| به حداکثر
+جهت قالب رو مشخص می‌کنه و درصد اطمینان از نسبت |امتیاز| به حداکثر
 امتیاز ممکن به دست میاد. فقط اندیکاتورهایی که هم‌جهت با سیگنال نهایی
 هستن توی لیست «دلایل» نمایش داده می‌شن.
 
@@ -12,11 +12,11 @@
 - روند EMA50 (فیلتر روند)   وزن 1   (قیمت بالا/پایین EMA50)
 - SMA 20/50 Trend          وزن 2   (روند میان‌مدت)
 - MACD Cross               وزن 1
-- MACD Histogram Momentum  وزن 1   (هیستوگرام در حال قوی‌تر شدنه یا ضعیف‌تر)
+- MACD Histogram Momentum  وزن 1   (هیستوگرام در حال قوی‌تر شدنه یا ضعیف‌تر شدن)
 - RSI Zone                 وزن 1   (بالای ۵۵ صعودی، زیر ۴۵ نزولی، بینابین خنثی)
 - موقعیت باند بولینگر       وزن 1   (نزدیکی به باند بالا/پایین)
 - اسپایک حجم                وزن 1   (هم‌جهت با کندل آخر)
-- روند OBV                 وزن 1   (جریان تجمعی پول - تاییدکننده‌ی مهم)
+- روند OBV                 وزن 1   (جریان تجمیعی پول - تاییدکننده‌ی مهم)
 - الگوی کندل‌استیک          وزن 1
 - واگرایی RSI/قیمت          وزن 2   (سیگنال بازگشتی قوی، وقتی معتبر تشخیص داده بشه)
 
@@ -27,13 +27,13 @@
   دیگه ثابت نیست؛ بر اساس قدرت روند (ADX) به‌صورت پویا تنظیم می‌شه: توی
   بازار پرروند، اندیکاتورهای روندی وزن بیشتر می‌گیرن و بالعکس توی بازار
   رنج/بی‌روند، RSI/بولینگر وزن بیشتری می‌گیرن. پس max_score دیگه همیشه
-  دقیقاً ۱۴ نیست - بسته به رژیم بازار تغییر می‌کنه (که کاملاً عادیه).
+  دقیقاً ۱۴ نیست - بسته به رژیم بازار تفاوت می‌کنه (که کاملاً عادیه).
 - آستانه‌ی صدور سیگنال (confidence_threshold_fraction) با رژیم نوسان
   (ATR percentile) تطبیق پیدا می‌کنه - توی نوسان بالا/شدید سخت‌گیرتر می‌شیم.
 - یه لایه‌ی دوم امتیازدهی (apply_context_confluence) اضافه شده که
   اطلاعات زمینه‌ای (هم‌راستایی تایم‌فریم بالاتر، همبستگی BTC، فشار
   اردربوک) رو - که قبلاً فقط نمایشی بودن - به یه تعدیل روی درصد اطمینان
-  نهایی تبدیل می‌کنه (بدون تغییر جهت سیگنال یا سطوح ورود/SL/TP).
+  نهایی تبدیل می‌کنه (بدون تفییر جهت سیگنال یا سطوح ورود/SL/TP).
 - الگوهای کندلی بیشتری تشخیص داده می‌شن: ستاره‌ی صبح/عصر (Morning/Evening
   Star) و دوجی برگشتی، علاوه بر پوشا/چکش/ستاره‌ی تیرانداز قبلی.
 
@@ -60,14 +60,14 @@ import pandas as pd
 
 SWING_LOOKBACK = 20          # تعداد کندل برای تشخیص آخرین سقف/کف
 ATR_SL_MULT = 1.5            # ضریب پیش‌فرض ATR برای حد ضرر
-MAX_STRUCTURE_SL_ATR_MULT = 3.0  # حداکثر فاصله‌ی مجاز SL ساختاری (بر حسب ATR) تا غیرمنطقی نشه
+MAX_STRUCTURE_SL_ATR_MULT = 3.0  # حداکثر فاصله‌ی مجاز SL ساختاری (بر حسب ATR) تا نامنطقی نشه
 RR_TARGETS = [1.0, 2.0, 3.0]     # نسبت‌های ریسک‌به‌ریوارد برای TP1/TP2/TP3
 
 ENTRY_PULLBACK_ATR_MULT = 0.3      # فاصله‌ی پیش‌فرض ورود پیشنهادی از قیمت فعلی (بر حسب ATR)
-MAX_ENTRY_PULLBACK_ATR_MULT = 1.2  # حداکثر فاصله‌ی مجاز پولبک تا EMA12 (وگرنه غیرواقعی می‌شه)
+MAX_ENTRY_PULLBACK_ATR_MULT = 1.2  # حداکثر فاصله‌ی مجاز پولبک تا EMA12 (وگرنه فیرواقعی می‌شه)
 
 MIN_CANDLES_FOR_ANALYSIS = 100
-MIN_CANDLES_REQUIRED = 60  # کمتر از این تعداد کندل واقعی، اندیکاتورهایی مثل SMA50 معتبر نیستن
+MIN_CANDLES_REQUIRED = 60  # کمتر از این تعداد کندل واقعی، اندیکاتورهایی مصل SMA50 معتبر نیستن
 
 TIMEFRAME_LABELS_FA = {
     "1m": "۱ دقیقه",
@@ -314,7 +314,7 @@ def _suggest_entry(price: float, atr: float, direction: str, ema12: float) -> tu
     به‌جای پیشنهاد قیمت لحظه‌ای به‌عنوان نقطه‌ی ورود (که یعنی خرید/فروش در
     همون لحظه، بدون فاصله از نوسان آنی)، یه نقطه‌ی ورود کمی منطقی‌تر
     پیشنهاد می‌ده: یا پولبک به EMA12 (اگه فاصله‌ش معقول بود)، یا حداقل
-    یه فاصله‌ی کوچیک (۰.۳ ATR) از قیمت فعلی - تا در اوج/کف لحظه‌ای وارد نشی.
+    یه فاصله‌ی کوچک (۰.۳ ATR) از قیمت فعلی - تا در اوج/کف لحظه‌ای وارد نشی.
     """
     if direction == "BUY":
         buffer_entry = price - ENTRY_PULLBACK_ATR_MULT * atr
@@ -369,7 +369,7 @@ def _calc_fibonacci_confirmation(swing_low: float, swing_high: float, price_to_c
 
 def _detect_volatility_regime(df: pd.DataFrame) -> dict:
     """
-    ATR فعلی رو نسبت به تاریخچه‌ی خودش (نه یه عدد مطلق) می‌سنجه - چون
+    ATR فعلی رو نسبت به تاریخچه‌ی خودش (نه یه عدد مطلق) می‌سنجد - چون
     نوسان «بالا» برای BTC و یه شیت‌کوین کوچیک کاملاً متفاوته. خروجی:
     سطح (کم/عادی/بالا/شدید) + درصد صدک + ضریب پیشنهادی کاهش حجم پوزیشن.
     """
@@ -431,7 +431,7 @@ def _calc_levels(df: pd.DataFrame, price: float, atr: float, direction: str, ema
     محاسبه‌ی نقطه‌ی ورود پیشنهادی، حد ضرر (ترکیب ATR و Swing High/Low) و
     ۳ تارگت سود بر پایه‌ی R-multiple (نسبت به فاصله‌ی ورود تا حد ضرر)
 
-    atr_sl_mult و rr_targets اختیاری‌ان - اگه داده نشن از مقادیر پیش‌فرض
+    atr_sl_mult و rr_targets اختیاریان - اگه داده نشن از مقادیر پیش‌فرض
     همین فایل استفاده می‌شه؛ پنل وب می‌تونه این‌ها رو override کنه.
     """
     atr_sl_mult = atr_sl_mult if atr_sl_mult is not None else ATR_SL_MULT
@@ -552,7 +552,7 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
     """
     df باید خروجی add_extended_indicators باشه (شامل حداقل ۵۰ کندل معتبر)
 
-    سه پارامتر آخر اختیاری‌ان و از پنل وب/تنظیمات دیتابیس قابل override
+    سه پارامتر آخر اختیاریان و از پنل وب/تنظیمات دیتابیس قابل override
     هستن؛ اگه داده نشن، از مقادیر پیش‌فرض همین فایل استفاده می‌شه.
     """
     from config import VOLATILITY_THRESHOLD_HIGH_MULT, VOLATILITY_THRESHOLD_EXTREME_MULT
@@ -582,7 +582,7 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
     # هر آیتم: (وزن, حالت صعودی؟, متن دلیل صعودی, متن دلیل نزولی, دسته)
     # دسته‌ی "trend" یعنی این اندیکاتور صرفاً یه نمای دیگه از همون روند
     # قیمته (به‌شدت با بقیه‌ی دسته‌ی trend هم‌بسته‌ست) - این‌ها بعداً توی
-    # پیام به یه خط ترکیبی خلاصه می‌شن تا لیست دلایل برای ارزهای مختلف
+    # پیام به یه خط ترکیبی خلاصه می‌شن تا لیست دلایل برای ارزهای متفاوت
     # یکسان و تکراری به‌نظر نرسه. دسته‌ی "unique" یعنی سیگنال مستقل و
     # متمایزکننده‌ست (این‌ها همیشه جدا نمایش داده می‌شن).
     # (این دسته‌بندی فقط برای فرمت متن دلایله؛ وزن‌دهی پویای ADX از
@@ -710,8 +710,8 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
                 matching_unique.append(text)
 
         # اگه ۳ یا بیشتر اندیکاتور روندی هم‌جهت بودن (که خیلی وقت‌ها توی
-        # بازار پرروند اتفاق می‌افته)، به‌جای تکرار تک‌تک، یه خط ترکیبی
-        # می‌سازیم تا پیام برای ارزهای مختلف متمایزتر به‌نظر برسه و
+        # بازار پرروند اتفاق می‌افته)، به‌جای تکرار، یه خط ترکیبی
+        # می‌سازیم تا پیام برای ارزهای متفاوت متمایزتر به‌نظر برسد و
         # اندیکاتورهای منحصربه‌فرد (RSI/OBV/حجم/الگو) بیشتر دیده بشن.
         if len(matching_trend) >= 3:
             dir_word = "صعودی" if direction == "BUY" else "نزولی"
@@ -768,7 +768,8 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
 
 def apply_context_confluence(result: SingleTFResult, higher_tf_info: dict = None,
                               btc_corr_info: dict = None, order_book_info: dict = None,
-                              historical_performance_info: dict = None) -> SingleTFResult:
+                              historical_performance_info: dict = None,
+                              second_higher_tf_info: dict = None) -> SingleTFResult:
     """
     اطلاعات زمینه‌ای (هم‌راستایی تایم‌فریم بالاتر، همبستگی BTC، فشار
     اردربوک، عملکرد تاریخی سیگنال‌های مشابه) که قبلاً فقط توی پیام نمایش
@@ -778,7 +779,7 @@ def apply_context_confluence(result: SingleTFResult, higher_tf_info: dict = None
     مطمئن باشیم» رو تعدیل می‌کنه.
 
     نتیجه توی result.context_adjusted_confidence_percent ذخیره می‌شه؛
-    اگه هیچ‌کدام از چهار ورودی موجود نبود، برابر confidence_percent اصلی می‌مونه.
+    اگه هیچ‌کدام از پنج ورودی موجود نبود، برابر confidence_percent اصلی می‌مونه.
     """
     from config import (
         CONTEXT_HTF_ALIGN_BONUS, CONTEXT_HTF_CONFLICT_PENALTY,
@@ -786,6 +787,7 @@ def apply_context_confluence(result: SingleTFResult, higher_tf_info: dict = None
         ORDER_BOOK_IMBALANCE_THRESHOLD,
         CONTEXT_HISTORICAL_WIN_RATE_BONUS_THRESHOLD, CONTEXT_HISTORICAL_WIN_RATE_PENALTY_THRESHOLD,
         CONTEXT_HISTORICAL_PERFORMANCE_BONUS, CONTEXT_HISTORICAL_PERFORMANCE_PENALTY,
+        CONTEXT_MULTI_TF_FULL_ALIGN_BONUS, CONTEXT_MULTI_TF_FULL_CONFLICT_PENALTY,
     )
 
     base = result.confidence_percent
@@ -804,6 +806,16 @@ def apply_context_confluence(result: SingleTFResult, higher_tf_info: dict = None
         else:
             adjustment -= CONTEXT_HTF_CONFLICT_PENALTY
             notes.append("مخالف روند تایم‌فریم بالاتر")
+
+    if higher_tf_info and second_higher_tf_info:
+        first_aligned = higher_tf_info["aligned"] and higher_tf_info["higher_tf_direction"] != "NEUTRAL"
+        second_aligned = second_higher_tf_info["aligned"] and second_higher_tf_info["higher_tf_direction"] != "NEUTRAL"
+        if first_aligned and second_aligned:
+            adjustment += CONTEXT_MULTI_TF_FULL_ALIGN_BONUS
+            notes.append("هم‌جهت با هر دو تایم‌فریم بالاتر")
+        elif not higher_tf_info["aligned"] and not second_higher_tf_info["aligned"]:
+            adjustment -= CONTEXT_MULTI_TF_FULL_CONFLICT_PENALTY
+            notes.append("مخالف هر دو تایم‌فریم بالاتر — احتیاط جدی")
 
     if btc_corr_info and btc_corr_info.get("high_correlation"):
         adjustment -= CONTEXT_BTC_HIGH_CORR_PENALTY
