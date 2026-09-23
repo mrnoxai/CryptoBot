@@ -42,6 +42,11 @@
   کدوم، جدا از واگرایی RSI) - چون این دو اندیکاتور برخلاف RSI مقیاس ثابت
   ۰-۱۰۰ ندارن، آستانه‌ی تشخیص به‌جای عدد مطلق، نسبی و بر پایه‌ی انحراف
   معیار خود اندیکاتور توی بازه‌ی اخیره (MIN_DIVERGENCE_INDICATOR_GAP_STD_MULT).
+- یادگیری از تاریخچه‌ی عملکرد سیگنال‌های گذشته (signal_performance): اگه
+  برای یه ترکیب دقیق نماد+تایم‌فریم+جهت حداقل ۵ سیگنال قطعی‌شده (نه در
+  انتظار) توی تاریخچه موجود باشه، نرخ برد تاریخی از طریق
+  apply_context_confluence روی درصد اطمینان نهایی هم تأثیر می‌گذاره (بونوس
+  در نرخ برد بالا، جزا در نرخ برد پایین).
 
 حد ضرر (SL): ترکیب ATR و آخرین Swing High/Low - هرکدوم منطقی‌تر و
 نزدیک‌تر به ساختار قیمت بود انتخاب می‌شه (نه صرفاً یه ضریب ثابت).
@@ -762,21 +767,25 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
 # ---------- هم‌نوایی زمینه‌ای (Context Confluence) - فاز ۱ تقویت موتور ----------
 
 def apply_context_confluence(result: SingleTFResult, higher_tf_info: dict = None,
-                              btc_corr_info: dict = None, order_book_info: dict = None) -> SingleTFResult:
+                              btc_corr_info: dict = None, order_book_info: dict = None,
+                              historical_performance_info: dict = None) -> SingleTFResult:
     """
     اطلاعات زمینه‌ای (هم‌راستایی تایم‌فریم بالاتر، همبستگی BTC، فشار
-    اردربوک) که قبلاً فقط توی پیام نمایش داده می‌شدن رو به یه تعدیل روی
-    درصد اطمینان نهایی تبدیل می‌کنه. جهت سیگنال و سطوح ورود/SL/TP که از
-    قبل بر پایه‌ی خود موتور محاسبه شدن، دست‌نخورده می‌مونن - این تابع
-    فقط «چقدر بهش مطمئن باشیم» رو تعدیل می‌کنه.
+    اردربوک، عملکرد تاریخی سیگنال‌های مشابه) که قبلاً فقط توی پیام نمایش
+    داده می‌شدن (یا اصلاً وجود نداشتن) رو به یه تعدیل روی درصد اطمینان
+    نهایی تبدیل می‌کنه. جهت سیگنال و سطوح ورود/SL/TP که از قبل بر
+    پایه‌ی خود موتور محاسبه شدن، دست‌نخورده می‌مونن - این تابع فقط «چقدر بهش
+    مطمئن باشیم» رو تعدیل می‌کنه.
 
     نتیجه توی result.context_adjusted_confidence_percent ذخیره می‌شه؛
-    اگه هیچ‌کدام از سه ورودی موجود نبود، برابر confidence_percent اصلی می‌مونه.
+    اگه هیچ‌کدام از چهار ورودی موجود نبود، برابر confidence_percent اصلی می‌مونه.
     """
     from config import (
         CONTEXT_HTF_ALIGN_BONUS, CONTEXT_HTF_CONFLICT_PENALTY,
         CONTEXT_BTC_HIGH_CORR_PENALTY, CONTEXT_ORDERBOOK_BONUS, CONTEXT_ORDERBOOK_PENALTY,
         ORDER_BOOK_IMBALANCE_THRESHOLD,
+        CONTEXT_HISTORICAL_WIN_RATE_BONUS_THRESHOLD, CONTEXT_HISTORICAL_WIN_RATE_PENALTY_THRESHOLD,
+        CONTEXT_HISTORICAL_PERFORMANCE_BONUS, CONTEXT_HISTORICAL_PERFORMANCE_PENALTY,
     )
 
     base = result.confidence_percent
@@ -816,6 +825,16 @@ def apply_context_confluence(result: SingleTFResult, higher_tf_info: dict = None
         elif result.direction == "SELL" and book_supports_buy:
             adjustment -= CONTEXT_ORDERBOOK_PENALTY
             notes.append("اردربوک مخالف (فشار خرید)")
+
+    if historical_performance_info:
+        win_rate = historical_performance_info["win_rate"]
+        sample_size = historical_performance_info["sample_size"]
+        if win_rate >= CONTEXT_HISTORICAL_WIN_RATE_BONUS_THRESHOLD:
+            adjustment += CONTEXT_HISTORICAL_PERFORMANCE_BONUS
+            notes.append(f"عملکرد تاریخی قوی برای این نوع سیگنال ({win_rate:.0f}% برد از {sample_size} نمونه)")
+        elif win_rate <= CONTEXT_HISTORICAL_WIN_RATE_PENALTY_THRESHOLD:
+            adjustment -= CONTEXT_HISTORICAL_PERFORMANCE_PENALTY
+            notes.append(f"عملکرد تاریخی ضعیف برای این نوع سیگنال ({win_rate:.0f}% برد از {sample_size} نمونه)")
 
     result.context_adjusted_confidence_percent = max(0, min(100, base + adjustment))
     result.context_notes = notes
