@@ -14,14 +14,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 
 # --- صرافی ---
-# قابل تنظیم با متغیر محیطی EXCHANGE_ID روی Railway (مثلاً binance, kucoin,
-# bybit, okx, gateio, mexc و...) تا اگه یک صرافی متد API رو محدود/مسدود کرد،
-# بدون توسعه‌ی کد و ریدیپلوی دستی بشه عوضش کرد. مقدار باید یک شناسه‌ی
-# معتبر ccxt باشه (لیست: https://github.com/ccxt/ccxt#supported-cryptocurrency-exchange-markets)
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binance")  # از طریق ccxt - نیازی به API Key برای دیتای قیمت نیست
 
 # --- تایم‌فریم‌ها و وزن هرکدوم در امتیاز نهایی ---
-# وزن بیشتر یعنی تاثیر بیشتر در تصمیم نهایی (روند بزرگ‌تر مهم‌تره)
+# وزن بیشتر یعنی تاثیر بیشتر در تصمیم نهایی (روند بزرگ‌تر مهمتره)
 TIMEFRAMES = {
     "15m": {"weight": 1, "candles": 100},
     "1h": {"weight": 2, "candles": 100},
@@ -94,12 +90,12 @@ SIGNAL_PERFORMANCE_CHECK_INTERVAL = 10 * 60  # هر ۱۰ دقیقه وضعیت �
 MAX_OPEN_SIGNALS_PER_CHECK = 200  # سقف تعداد سیگنال باز در هر دور بررسی (جلوگیری از بار زیاد روی API)
 
 # --- پنل وب مدیریت تنظیمات ---
-# این‌ها رو توی .env تنظیم کن؛ پیش‌فرض‌های زیر فقط برای جلوگیری از کرش
-# محیط توسعه‌ست - حتماً روی پروداکشن عوضشون
+# این‌ها رو توی .env تنظیم کن، پیش‌فرض‌های زیر فقط برای جلوگیری از کرش
+# محیط توسعه‌است - حتماً روی پروداکشن عوضشون کن
 WEB_PANEL_USERNAME = os.getenv("WEB_PANEL_USERNAME", "admin")
 WEB_PANEL_PASSWORD = os.getenv("WEB_PANEL_PASSWORD", "")
 WEB_PANEL_ENABLED = os.getenv("WEB_PANEL_ENABLED", "true").lower() in ("1", "true", "yes")
-# Railway خودش این متغیر رو ست می‌کنه؛ لوکال دیفالت 8000
+# Railway خودش این متفیر رو ست می‌کنه؛ لوکال دیفالت 8000
 WEB_PANEL_PORT = int(os.getenv("PORT", "8000"))
 
 # --- فیبوناچی (تاییدکننده‌ی SL/TP) ---
@@ -129,27 +125,27 @@ FUNDAMENTALS_ENABLED = True
 COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
 FEAR_GREED_URL = "https://api.alternative.me/fng/"
 FUNDAMENTALS_CACHE_TTL_COIN = 30 * 60     # اطلاعات هر کوین: هر ۳۰ دقیقه تازه‌سازی کن
-FUNDAMENTALS_CACHE_TTL_MARKET = 15 * 60   # ترس‌وطمع/دامینانس: هر ۱۵ دقیقه
+FUNDAMENTALS_CACHE_TTL_MARKET = 15 * 60   # ترس‌وطمع/دامیننس: هر ۱۵ دقیقه
 
 # --- تحلیل فراداده (Meta-Analytics) ---
 # MIN_SAMPLES_FOR_CONFIDENCE توی analytics.py تعریف شده (نه اینجا) چون
 # فقط همون‌جا استفاده می‌شه
 
-# --- بکاپ خودکار دیتابیس ---
-# پیش‌فرض: کنار خودِ فایل دیتابیس، توی یه پوشه‌ی backups/ - یعنی
-# اگه DB_PATH روی Volume دائمی Railway باشه (مثل /data/bot_database.db)،
-# بکاپ‌ها هم خودکار روی همون دیسک دائمی ذخیره می‌شن، نه دیسک موقت
+# --- بکاف خودکار دیتابیس ---
+# پیش‌فرض: کنار خودِ فایل دیتابیس، توی یه پوشه‌ی backups/ - یعنی اگه
+# DB_PATH روی Volume دائمی Railway باشه (مثل /data/bot_database.db)،
+# بکاف‌ها هم خودکار روی همون دیسک دائمی ذخیره می‌شن، نه دیسک موقت
 BACKUP_DIR = os.getenv(
     "BACKUP_DIR",
     os.path.join(os.path.dirname(os.path.abspath(DB_PATH)) or ".", "backups")
 )
 BACKUP_INTERVAL_HOURS = float(os.getenv("BACKUP_INTERVAL_HOURS", "6"))
 BACKUP_INTERVAL_SECONDS = int(BACKUP_INTERVAL_HOURS * 3600)
-BACKUP_MAX_COUNT = int(os.getenv("BACKUP_MAX_COUNT", "14"))  # حداکثر تعداد بکاپ نگه‌داری‌شده (رول می‌شه)
+BACKUP_MAX_COUNT = int(os.getenv("BACKUP_MAX_COUNT", "14"))  # حداکثر تعداد بکاف نگه‌داشته‌شده (رول می‌شه)
 
 # ---------- فاز ۱ تقویت موتور سیگنال: ADX + نوسان + هم‌نوایی زمینه‌ای ----------
-# این بخش برای بهبود دقت موتور /signal اضافه شد (بدون تقییر رفتار قبلی
-# در صورت نافعال‌بودن؛ فقط با اضافه‌شدن این مقادیر پیش‌فرض فعال می‌شه)
+# این بخش برای بهبود دقت موتور /signal اضافه شد (بدون تفییر رفتار قبلی
+# در صورت فعال‌نبودن، فقط با اضافه‌شدن این مقادیر پیش‌فرض فعال می‌شه)
 
 # قدرت روند (ADX) - برای وزن‌دهی پویا به اندیکاتورهای روندی در برابر بازگشت‌به‌میانگین
 ADX_TREND_THRESHOLD = 25          # ADX بالاتر از این یعنی روند قویه (اندیکاتورهای روندی معتبرترن)
@@ -170,3 +166,10 @@ CONTEXT_HTF_CONFLICT_PENALTY = 15  # جریمه‌ی اطمینان وقتی م�
 CONTEXT_BTC_HIGH_CORR_PENALTY = 5  # جریمه‌ی اطمینان وقتی همبستگی با BTC خیلی بالاست (سیگنال مستقل نیست)
 CONTEXT_ORDERBOOK_BONUS = 5        # پاداش اطمینان وقتی فشار اردربوک هم‌جهته
 CONTEXT_ORDERBOOK_PENALTY = 8      # جریمه‌ی اطمینان وقتی فشار اردربوک مخالفه
+
+# ---------- فاز ۲ تقویت موتور سیگنال: یادگیری از تاریخچه‌ی عملکرد سیگنال‌ها ----------
+# نرخ برد تاریخی سیگنال‌های قبلی با همون نماد/تایم‌فریم/جهت (از signal_performance) روی
+CONTEXT_HISTORICAL_WIN_RATE_BONUS_THRESHOLD = 60
+CONTEXT_HISTORICAL_WIN_RATE_PENALTY_THRESHOLD = 40
+CONTEXT_HISTORICAL_PERFORMANCE_BONUS = 6
+CONTEXT_HISTORICAL_PERFORMANCE_PENALTY = 10
