@@ -6,7 +6,7 @@
    آلت‌کوین واقعاً مال خودشه یا صرفاً داره دنبال کل بازار می‌ره
 """
 import pandas as pd
-from config import HIGHER_TIMEFRAME_MAP, BTC_SYMBOL, BTC_CORRELATION_LOOKBACK, BTC_HIGH_CORRELATION_THRESHOLD
+from config import HIGHER_TIMEFRAME_MAP, SECOND_HIGHER_TIMEFRAME_MAP, BTC_SYMBOL, BTC_CORRELATION_LOOKBACK, BTC_HIGH_CORRELATION_THRESHOLD
 
 
 def _quick_trend_direction(df: pd.DataFrame) -> str:
@@ -48,6 +48,35 @@ async def check_higher_timeframe_alignment(client, symbol: str, timeframe: str, 
     یا None اگه تایم‌فریم بالاتری برای مقایسه وجود نداشته باشه (مثلاً روزانه)
     """
     higher_tf = HIGHER_TIMEFRAME_MAP.get(timeframe)
+    if not higher_tf or signal_direction == "NEUTRAL":
+        return None
+
+    try:
+        df = await client.fetch_ohlcv_df(symbol, higher_tf, limit=60)
+    except Exception:
+        return None
+
+    if len(df) < 26:
+        return None
+
+    higher_direction = _quick_trend_direction(df)
+    aligned = (higher_direction == signal_direction) or (higher_direction == "NEUTRAL")
+
+    return {
+        "higher_tf": higher_tf,
+        "higher_tf_direction": higher_direction,
+        "aligned": aligned,
+    }
+
+
+async def check_second_higher_timeframe_alignment(client, symbol: str, timeframe: str, signal_direction: str) -> dict | None:
+    """
+    مثل check_higher_timeframe_alignment ولی روی یه تایم‌فریم حتی بالاتر (دومی) که توی
+    SECOND_HIGHER_TIMEFRAME_MAP تعریف شده - برای ادفام هم‌جهتی چندتایم‌فریمی.
+    خروجی: {"higher_tf": "1d", "higher_tf_direction": "BUY"/"SELL"/"NEUTRAL", "aligned": bool}
+    یا None اگه تایم‌فریم بالاتری برای مقایسه وجود نداشته باشه
+    """
+    higher_tf = SECOND_HIGHER_TIMEFRAME_MAP.get(timeframe)
     if not higher_tf or signal_direction == "NEUTRAL":
         return None
 
