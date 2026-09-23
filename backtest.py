@@ -2,11 +2,11 @@
 بک‌تست خودکار موتور سیگنال روی داده‌ی تاریخی
 
 روش کار:
-اندیکاتورها یه‌بار روی کل دیتافریم محاسبه می‌شن (چون همه‌شون علّی/causal
+اندیکاتورها یه‌بار روی کل دیتافریم محاسبه می‌شن (چون همه‌شون علی/causal
 هستن - یعنی مقدارشون در هر لحظه فقط به داده‌ی تا همون لحظه بستگی داره،
 نه آینده؛ برای اطمینان بیشتر، برای صدور سیگنال در هر نقطه فقط از
 df.iloc[:i+1] استفاده می‌شه، یعنی موتور اصلاً نمی‌تونه به کندل‌های بعدی
-دسترسی داشته باشه). سپس برای هر کندل i (بعد از دوره‌ی warmup):
+دسترسی داشه باشه). سپس برای هر کندل i (بعد از دوره‌ی warmup):
 - موتور signal رو دقیقاً با همون منطق زنده‌ی /signal صدا می‌زنیم
 - اگه سیگنال قطعی (BUY/SELL) بود، فرض می‌کنیم ورود در کندل بعدی (i+1)
   با قیمت باز شدنش (Open) انجام می‌شه - این روش استاندارد و محافظه‌کارانه‌ست
@@ -171,7 +171,7 @@ def run_backtest(
 ) -> BacktestResult:
     """
     df باید کندل‌های خام (بدون اندیکاتور) و مرتب‌شده بر اساس زمان باشه.
-    اندیکاتورها یه‌بار این‌جا (وکتورایز، سریع) محاسبه می‌شن.
+    اندیکاتورها یه‌بار این‌جا (وکتایرایز، سریع) محاسبه می‌شن.
     """
     df = add_extended_indicators(df.copy()).reset_index(drop=True)
     n = len(df)
@@ -237,7 +237,7 @@ def run_walk_forward_backtest(
     استراتژی فقط روی یه بازه‌ی خاص (مثلاً یه رالی صعودی) خوب بوده
     (overfitting/شانسی) یا واقعاً روی چند دوره‌ی متفاوت پایداره.
 
-    برای اینکه اندیکاتورهای هر بازه از همون ابتدا معتبر باشن، هر بازه
+    برای اینکه اندیکاتورهای هر بازه از همون ابدا معتبر باشن، هر بازه
     (به‌جز اولی) به‌اندازه‌ی warmup کندل از قبل خودش هم قرض می‌گیره -
     این کندل‌های قرضی صرفاً برای محاسبه‌ی اندیکاتورن، جزو بازه‌ی
     معامله‌گیری حساب نمی‌شن. بازه‌ی اول این امکان رو نداره (چیزی قبلش
@@ -258,7 +258,7 @@ def run_walk_forward_backtest(
         segment_df = df.iloc[fetch_start:seg_end].reset_index(drop=True)
 
         if fetch_start > 0:
-            effective_warmup = seg_start - fetch_start  # دقیقاً برابر warmup، مگر نزدیک ابتدای داده باشیم
+            effective_warmup = seg_start - fetch_start  # دقیقاً برابر warmup، مگر نزدیک ابدای داده باشیم
         else:
             effective_warmup = warmup  # بازه‌ی اول - چیزی برای قرض گرفتن نیست
 
@@ -277,3 +277,110 @@ def run_walk_forward_backtest(
         results.append(result)
 
     return results
+# ==================== کالیبراسیون وزن‌ها (Walk-Forward Grid Search) ====================
+
+CALIBRATION_SEGMENTS = 3
+CALIBRATION_CONFIDENCE_CANDIDATES = [0.15, 0.25, 0.35]
+CALIBRATION_ATR_SL_MULT_CANDIDATES = [1.0, 1.5, 2.0]
+CALIBRATION_MIN_TRADES = 10
+CALIBRATION_STABILITY_PENALTY_WEIGHT = 2.0
+
+
+@dataclass
+class CalibrationCandidate:
+    confidence_threshold_fraction: float
+    atr_sl_mult: float
+    total_trades: int
+    win_rate: object
+    avg_r: object
+    total_r: float
+    win_rate_spread: object
+    composite_score: object
+    reliable: bool
+
+
+def evaluate_calibration_candidate(
+    symbol_dfs: list, confidence_threshold_fraction: float, atr_sl_mult: float,
+    segments: int = CALIBRATION_SEGMENTS,
+) -> CalibrationCandidate:
+    """
+    یه ترکیب (confidence_threshold_fraction, atr_sl_mult) رو روی همه‌ی
+    نمادهای داده‌شده با بک‌تست پیشرو (Walk-Forward) می‌سنجه و نتایج
+    همه‌ی نمادها/بازه‌ها رو با هم جمع می‌کنه - هدف اینه که این تنظیمات
+    سراسری (که روی همه‌ی کاربران/نمادها اثر می‌ذارن) بیش‌ازحد روی یه
+    نماد خاص overfit نشن.
+    """
+    all_resolved_trades = []
+    segment_win_rates = []
+
+    for symbol, timeframe, df in symbol_dfs:
+        try:
+            results = run_walk_forward_backtest(
+                df, symbol, timeframe, segments=segments,
+                confidence_threshold_fraction=confidence_threshold_fraction,
+                atr_sl_mult=atr_sl_mult,
+            )
+        except Exception:
+            continue  # این نماد رو رد می‌کنیم، بقیه رو ادامه می‌دیم
+
+        for r in results:
+            all_resolved_trades.extend(r.resolved_trades)
+            if r.win_rate is not None:
+                segment_win_rates.append(r.win_rate)
+
+    total_trades = len(all_resolved_trades)
+    if total_trades:
+        wins = sum(1 for t in all_resolved_trades if t.r_multiple > 0)
+        win_rate = wins / total_trades * 100
+        total_r = sum(t.r_multiple for t in all_resolved_trades)
+        avg_r = total_r / total_trades
+    else:
+        win_rate = None
+        total_r = 0.0
+        avg_r = None
+
+    if len(segment_win_rates) >= 2:
+        win_rate_spread = max(segment_win_rates) - min(segment_win_rates)
+    else:
+        win_rate_spread = None
+
+    reliable = total_trades >= CALIBRATION_MIN_TRADES
+
+    if reliable and avg_r is not None:
+        penalty = (win_rate_spread / 100) * CALIBRATION_STABILITY_PENALTY_WEIGHT if win_rate_spread is not None else 0.0
+        composite_score = avg_r - penalty
+    else:
+        composite_score = None
+
+    return CalibrationCandidate(
+        confidence_threshold_fraction=confidence_threshold_fraction,
+        atr_sl_mult=atr_sl_mult,
+        total_trades=total_trades,
+        win_rate=win_rate,
+        avg_r=avg_r,
+        total_r=total_r,
+        win_rate_spread=win_rate_spread,
+        composite_score=composite_score,
+        reliable=reliable,
+    )
+
+
+def run_weight_calibration(symbol_dfs: list, segments: int = CALIBRATION_SEGMENTS) -> list:
+    """
+    گرید-سرچ روی ترکیب‌های confidence_threshold_fraction × atr_sl_mult؛
+    خروجی لیستی از CalibrationCandidate، مرتب‌شده: قابل‌اتکاها اول
+    (بر اساس composite_score نزولی)، بعد غیرقابل‌اتکاها (صرفاً برای
+    نمایش تعداد معامله، نه پیشنهاد - چون آمارشون کافی نیست).
+    """
+    candidates = []
+    for confidence_threshold_fraction in CALIBRATION_CONFIDENCE_CANDIDATES:
+        for atr_sl_mult in CALIBRATION_ATR_SL_MULT_CANDIDATES:
+            candidates.append(evaluate_calibration_candidate(
+                symbol_dfs, confidence_threshold_fraction, atr_sl_mult, segments=segments,
+            ))
+
+    reliable = [c for c in candidates if c.reliable]
+    unreliable = [c for c in candidates if not c.reliable]
+    reliable.sort(key=lambda c: c.composite_score, reverse=True)
+    unreliable.sort(key=lambda c: c.total_trades, reverse=True)
+    return reliable + unreliable
