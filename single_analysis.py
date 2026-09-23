@@ -2,12 +2,12 @@
 موتور تحلیل حرفه‌ای تک‌تایم‌فریمی
 
 روش کار:
-هر اندیکاتور یه رأی وزن‌دار (bull/bear/neutral) میده. جمع امتزار وزن‌دار
+هر اندیکاتور یه رأی وزن‌دار (bull/bear/neutral) میده. جمع امتیاز وزن‌دار
 جهت غالب رو مشخص می‌کنه و درصد اطمینان از نسبت |امتیاز کل| به حداکثر
 امتیاز ممکن به دست میاد. فقط اندیکاتورهایی که هم‌جهت با سیگنال نهایی
 هستن توی لیست «دلایل» نمایش داده می‌شن.
 
-اندیکاتورها و وزن‌شون:
+اندیکاتورها و وزن پایه‌شون:
 - EMA 12/26 Cross          وزن 2   (تقاطع کوتاه‌مدت/میان‌مدت)
 - روند EMA50 (فیلتر روند)   وزن 1   (قیمت بالا/پایین EMA50)
 - SMA 20/50 Trend          وزن 2   (روند میان‌مدت)
@@ -20,7 +20,22 @@
 - الگوی کندل‌استیک          وزن 1
 - واگرایی RSI/قیمت          وزن 2   (سیگنال بازگشتی قوی، وقتی معتبر تشخیص داده بشه)
 
-حداکثر امتیاز ممکن = 2+1+2+1+1+1+1+1+1+1+2 = 14 (واگرایی همیشه رأی نمی‌ده)
+حداکثر امتیاز پایه = 2+1+2+1+1+1+1+1+1+1+2 = 14 (واگرایی همیشه رأی نمی‌ده)
+
+** فاز ۱ تقویت موتور (اضافه‌شده): **
+- وزن اندیکاتورهای روندی (EMA/SMA/MACD/OBV) و بازگشت‌به‌میانگین (RSI/بولینگر)
+  دیگه ثابت نیست؛ بر اساس قدرت روند (ADX) به‌صورت پویا تنظیم می‌شه: توی
+  بازار پرروند، اندیکاتورهای روندی وزن بیشتر می‌گیرن و بالعکس توی بازار
+  رنج/بی‌روند، RSI/بولینگر وزن بیشتری می‌گیرن. پس max_score دیگه همیشه
+  دقیقاً ۱۴ نیست - بسته به رژیم بازار تغییر می‌کنه (که کاملاً عادیه).
+- آستانه‌ی صدور سیگنال (confidence_threshold_fraction) با رژیم نوسان
+  (ATR percentile) تطبیق پیدا می‌کنه - توی نوسان بالا/شدید سخت‌گیرتر می‌شیم.
+- یه لایه‌ی دوم امتیازدهی (apply_context_confluence) اضافه شده که
+  اطلاعات زمینه‌ای (هم‌راستایی تایم‌فریم بالاتر، همبستگی BTC، فشار
+  اردربوک) رو - که قبلاً فقط نمایشی بودن - به یه تعدیل روی درصد اطمینان
+  نهایی تبدیل می‌کنه (بدون تغییر جهت سیگنال یا سطوح ورود/SL/TP).
+- الگوهای کندلی بیشتری تشخیص داده می‌شن: ستاره‌ی صبح/عصر (Morning/Evening
+  Star) و دوجی برگشتی، علاوه بر پوشا/چکش/ستاره‌ی تیرانداز قبلی.
 
 حد ضرر (SL): ترکیب ATR و آخرین Swing High/Low - هرکدوم منطقی‌تر و
 نزدیک‌تر به ساختار قیمت بود انتخاب می‌شه (نه صرفاً یه ضریب ثابت).
@@ -97,7 +112,12 @@ def add_extended_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ---------- تشخیص الگوی کندل‌استیک (سبک و مستقل، بدون نیاز به ta) ----------
 
 def _detect_last_candle_pattern(df: pd.DataFrame) -> dict | None:
-    """بررسی ۲ کندل آخر برای الگوهای پرکاربرد؛ خروجی {"name":.., "bias": 1|-1} یا None"""
+    """
+    بررسی چند کندل آخر برای الگوهای پرکاربرد؛ خروجی {"name":.., "bias": 1|-1} یا None
+
+    فاز ۱ تقویت موتور: علاوه بر پوشا/چکش/ستاره‌ی تیرانداز (قبلاً موجود
+    بود)، الگوهای ستاره‌ی صبح/عصر (۳کندلی) و دوجی برگشتی هم اضافه شدن.
+    """
     if len(df) < 2:
         return None
     last = df.iloc[-1]
@@ -114,6 +134,25 @@ def _detect_last_candle_pattern(df: pd.DataFrame) -> dict | None:
     last_bullish = last["close"] > last["open"]
     prev_bullish = prev["close"] > prev["open"]
 
+    # --- ستاره‌ی صبح/عصر (۳کندلی) - اولویت اول چون معمولاً معتبرترن ---
+    if len(df) >= 3:
+        first = df.iloc[-3]
+        first_body = abs(first["close"] - first["open"])
+        first_bullish = first["close"] > first["open"]
+        mid_range = prev["high"] - prev["low"]
+        mid_is_small = (prev_body <= mid_range * 0.35) if mid_range > 0 else False
+
+        if (first_body > 0 and not first_bullish and mid_is_small and last_bullish
+                and last_body > first_body * 0.5
+                and last["close"] > (first["open"] + first["close"]) / 2):
+            return {"name": "ستاره‌ی صبح (Morning Star)", "bias": 1}
+
+        if (first_body > 0 and first_bullish and mid_is_small and not last_bullish
+                and last_body > first_body * 0.5
+                and last["close"] < (first["open"] + first["close"]) / 2):
+            return {"name": "ستاره‌ی عصر (Evening Star)", "bias": -1}
+
+    # --- پوشا (Engulfing) ---
     if prev_body > 0:
         if (not prev_bullish and last_bullish
                 and last["close"] >= prev["open"] and last["open"] <= prev["close"]
@@ -124,11 +163,22 @@ def _detect_last_candle_pattern(df: pd.DataFrame) -> dict | None:
                 and last_body > prev_body):
             return {"name": "پوشای نزولی (Bearish Engulfing)", "bias": -1}
 
+    # --- چکش / ستاره‌ی تیرانداز ---
     if last_body > 0 and last_body / last_range < 0.35:
         if lower_wick > last_body * 2 and upper_wick < last_body * 0.5:
             return {"name": "چکش (Hammer)", "bias": 1}
         if upper_wick > last_body * 2 and lower_wick < last_body * 0.5:
             return {"name": "ستاره‌ی تیرانداز (Shooting Star)", "bias": -1}
+
+    # --- دوجی برگشتی (بعد از چند کندل هم‌جهت) ---
+    if last_range > 0 and (last_body / last_range) < 0.1 and len(df) >= 4:
+        prior = df.iloc[-4:-1]
+        prior_up = (prior["close"] > prior["open"]).sum() >= 2 and prior["close"].iloc[-1] > prior["close"].iloc[0]
+        prior_down = (prior["close"] < prior["open"]).sum() >= 2 and prior["close"].iloc[-1] < prior["close"].iloc[0]
+        if prior_up:
+            return {"name": "دوجی برگشتی بعد از روند صعودی (احتیاط)", "bias": -1}
+        if prior_down:
+            return {"name": "دوجی برگشتی بعد از روند نزولی (احتیاط)", "bias": 1}
 
     return None
 
@@ -281,6 +331,39 @@ def _detect_volatility_regime(df: pd.DataFrame) -> dict:
     return {"level": "عادی", "percentile": percentile, "risk_mult": 1.0}
 
 
+# ---------- وزن‌دهی پویا بر اساس قدرت روند (ADX) - فاز ۱ تقویت موتور ----------
+
+def _adx_adjusted_weight(base_weight: float, weight_category: str, adx_val: float) -> float:
+    """
+    وزن هر اندیکاتور رو بر اساس قدرت روند (ADX) تنظیم می‌کنه: توی بازار
+    پرروند، اندیکاتورهای روندی (EMA/SMA/MACD/OBV) قابل‌اعتمادترن؛ توی
+    بازار رنج/بی‌روند، اندیکاتورهای بازگشت‌به‌میانگین (RSI/بولینگر)
+    قابل‌اعتمادترن. اندیکاتورهای مستقل (حجم/الگو/واگرایی) دست‌نخورده
+    می‌مونن - این‌ها فارغ از رژیم بازار معتبرن.
+
+    weight_category یه برچسب داخلیه، جدا از category نمایشی توی votes
+    (که فقط برای گروه‌بندی متن دلایل استفاده می‌شه).
+    """
+    from config import (
+        ADX_TREND_THRESHOLD, ADX_RANGE_THRESHOLD,
+        ADX_TREND_WEIGHT_BOOST, ADX_TREND_WEIGHT_CUT,
+        ADX_MEANREV_WEIGHT_BOOST, ADX_MEANREV_WEIGHT_CUT,
+    )
+    if weight_category == "trend":
+        if adx_val >= ADX_TREND_THRESHOLD:
+            return base_weight * ADX_TREND_WEIGHT_BOOST
+        if adx_val < ADX_RANGE_THRESHOLD:
+            return base_weight * ADX_TREND_WEIGHT_CUT
+        return base_weight
+    if weight_category == "mean_reversion":
+        if adx_val < ADX_RANGE_THRESHOLD:
+            return base_weight * ADX_MEANREV_WEIGHT_BOOST
+        if adx_val >= ADX_TREND_THRESHOLD:
+            return base_weight * ADX_MEANREV_WEIGHT_CUT
+        return base_weight
+    return base_weight
+
+
 def _calc_levels(df: pd.DataFrame, price: float, atr: float, direction: str, ema12: float,
                   atr_sl_mult: float = None, rr_targets: list = None) -> dict:
     """
@@ -374,6 +457,9 @@ class SingleTFResult:
     volatility_risk_mult: float = 1.0
     support: float = None
     resistance: float = None
+    # --- فاز ۱ تقویت موتور: نتیجه‌ی هم‌نوایی زمینه‌ای ---
+    context_adjusted_confidence_percent: int = None
+    context_notes: list = field(default_factory=list)
 
     @property
     def confidence_percent(self) -> int:
@@ -406,6 +492,8 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
     سه پارامتر آخر اختیاری‌ان و از پنل وب/تنظیمات دیتابیس قابل override
     هستن؛ اگه داده نشن، از مقادیر پیش‌فرض همین فایل استفاده می‌شه.
     """
+    from config import VOLATILITY_THRESHOLD_HIGH_MULT, VOLATILITY_THRESHOLD_EXTREME_MULT
+
     confidence_threshold_fraction = (
         confidence_threshold_fraction if confidence_threshold_fraction is not None
         else DEFAULT_CONFIDENCE_THRESHOLD_FRACTION
@@ -416,32 +504,61 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
 
     pattern = _detect_last_candle_pattern(df)
 
+    adx_val = float(last["adx"]) if not pd.isna(last.get("adx", float("nan"))) else 0.0
+    volatility = _detect_volatility_regime(df)
+
+    # آستانه‌ی صدور سیگنال رو با توجه به نوسان فعلی بازار تنظیم می‌کنیم:
+    # توی نوسان بالا/شدید، برای جلوگیری از سیگنال‌های نویزی، سخت‌گیرتر می‌شیم
+    effective_threshold_fraction = confidence_threshold_fraction
+    if volatility["level"].startswith("شدید"):
+        effective_threshold_fraction *= VOLATILITY_THRESHOLD_EXTREME_MULT
+    elif volatility["level"].startswith("بالا"):
+        effective_threshold_fraction *= VOLATILITY_THRESHOLD_HIGH_MULT
+    effective_threshold_fraction = min(effective_threshold_fraction, 0.9)  # سقف منطقی
+
     # هر آیتم: (وزن, حالت صعودی؟, متن دلیل صعودی, متن دلیل نزولی, دسته)
     # دسته‌ی "trend" یعنی این اندیکاتور صرفاً یه نمای دیگه از همون روند
     # قیمته (به‌شدت با بقیه‌ی دسته‌ی trend هم‌بسته‌ست) - این‌ها بعداً توی
     # پیام به یه خط ترکیبی خلاصه می‌شن تا لیست دلایل برای ارزهای مختلف
     # یکسان و تکراری به‌نظر نرسه. دسته‌ی "unique" یعنی سیگنال مستقل و
     # متمایزکننده‌ست (این‌ها همیشه جدا نمایش داده می‌شن).
+    # (این دسته‌بندی فقط برای فرمت متن دلایله؛ وزن‌دهی پویای ADX از
+    # weight_category جدا مشخص می‌شه - پایین‌تر توضیح داده شده.)
     votes = []
 
-    votes.append((2, last["ema12"] > last["ema26"], "کراس صعودی EMA 12/26", "کراس نزولی EMA 12/26", "trend"))
+    votes.append((
+        _adx_adjusted_weight(2, "trend", adx_val),
+        last["ema12"] > last["ema26"], "کراس صعودی EMA 12/26", "کراس نزولی EMA 12/26", "trend"
+    ))
 
     if not pd.isna(last["ema50"]):
-        votes.append((1, price > last["ema50"], "قیمت بالای EMA50 (روند صعودی)", "قیمت زیر EMA50 (روند نزولی)", "trend"))
+        votes.append((
+            _adx_adjusted_weight(1, "trend", adx_val),
+            price > last["ema50"], "قیمت بالای EMA50 (روند صعودی)", "قیمت زیر EMA50 (روند نزولی)", "trend"
+        ))
 
-    votes.append((2, last["sma20"] > last["sma50"], "روند صعودی SMA (20>50)", "روند نزولی SMA (20<50)", "trend"))
+    votes.append((
+        _adx_adjusted_weight(2, "trend", adx_val),
+        last["sma20"] > last["sma50"], "روند صعودی SMA (20>50)", "روند نزولی SMA (20<50)", "trend"
+    ))
 
-    votes.append((1, last["macd"] > last["macd_signal"], "کراس صعودی MACD", "کراس نزولی MACD", "trend"))
+    votes.append((
+        _adx_adjusted_weight(1, "trend", adx_val),
+        last["macd"] > last["macd_signal"], "کراس صعودی MACD", "کراس نزولی MACD", "trend"
+    ))
 
     if len(df) >= 4 and not df["macd_hist"].iloc[-3:].isna().any():
         hist_trend_up = df["macd_hist"].iloc[-1] > df["macd_hist"].iloc[-3]
-        votes.append((1, hist_trend_up, "هیستوگرام MACD در حال تقویت", "هیستوگرام MACD در حال تضعیف", "trend"))
+        votes.append((
+            _adx_adjusted_weight(1, "trend", adx_val),
+            hist_trend_up, "هیستوگرام MACD در حال تقویت", "هیستوگرام MACD در حال تضعیف", "trend"
+        ))
 
     rsi_val = float(last["rsi"]) if not pd.isna(last["rsi"]) else 50.0
     if rsi_val >= 55:
-        votes.append((1, True, f"RSI در ناحیه‌ی صعودی ({rsi_val:.1f})", "", "unique"))
+        votes.append((_adx_adjusted_weight(1, "mean_reversion", adx_val), True, f"RSI در ناحیه‌ی صعودی ({rsi_val:.1f})", "", "unique"))
     elif rsi_val <= 45:
-        votes.append((1, False, "", f"RSI در ناحیه‌ی نزولی ({rsi_val:.1f})", "unique"))
+        votes.append((_adx_adjusted_weight(1, "mean_reversion", adx_val), False, "", f"RSI در ناحیه‌ی نزولی ({rsi_val:.1f})", "unique"))
     # بین ۴۵ تا ۵۵: رأی نمی‌ده (خنثی)
 
     if not pd.isna(last["bb_upper"]) and not pd.isna(last["bb_lower"]):
@@ -449,10 +566,11 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
         if band_width > 0:
             dist_lower = abs(price - last["bb_lower"]) / band_width
             dist_upper = abs(price - last["bb_upper"]) / band_width
+            w = _adx_adjusted_weight(1, "mean_reversion", adx_val)
             if dist_lower < 0.15:
-                votes.append((1, True, "قیمت نزدیک باند پایین بولینگر (اشباع فروش)", "", "unique"))
+                votes.append((w, True, "قیمت نزدیک باند پایین بولینگر (اشباع فروش)", "", "unique"))
             elif dist_upper < 0.15:
-                votes.append((1, False, "", "قیمت نزدیک باند بالای بولینگر (اشباع خرید)", "unique"))
+                votes.append((w, False, "", "قیمت نزدیک باند بالای بولینگر (اشباع خرید)", "unique"))
 
     if not pd.isna(last["volume_sma"]) and last["volume_sma"] > 0 and len(df) >= 21:
         if last["volume"] >= last["volume_sma"] * 1.5:
@@ -461,7 +579,10 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
 
     if len(df) >= 15 and not df["obv"].iloc[-15:].isna().any():
         obv_trend_up = df["obv"].iloc[-1] > df["obv"].iloc[-15]
-        votes.append((1, obv_trend_up, "روند صعودی OBV (تایید جریان پول خرید)", "روند نزولی OBV (تایید جریان پول فروش)", "unique"))
+        votes.append((
+            _adx_adjusted_weight(1, "trend", adx_val),
+            obv_trend_up, "روند صعودی OBV (تایید جریان پول خرید)", "روند نزولی OBV (تایید جریان پول فروش)", "unique"
+        ))
 
     if pattern:
         if pattern["bias"] > 0:
@@ -485,8 +606,9 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
         else:
             score -= weight
 
-    # آستانه: حداقل ۲۵٪ از حداکثر امتیاز فاصله از صفر لازمه تا سیگنال قطعی صادر بشه
-    threshold = max_score * confidence_threshold_fraction
+    # آستانه: حداقل بخشی از حداکثر امتیاز فاصله از صفر لازمه تا سیگنال
+    # قطعی صادر بشه (این بخش با رژیم نوسان بازار تطبیق پیدا کرده - بالاتر)
+    threshold = max_score * effective_threshold_fraction
     if score >= threshold:
         direction = "BUY"
     elif score <= -threshold:
@@ -523,12 +645,10 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
         # دلایل منحصربه‌فرد رو اول لیست می‌ذاریم چون اطلاعات بیشتری دارن
         reasons = matching_unique + reasons
 
-    adx_val = float(last["adx"]) if not pd.isna(last.get("adx", float("nan"))) else 0.0
     levels = _calc_levels(
         df, price, atr, direction, float(last["ema12"]) if not pd.isna(last["ema12"]) else None,
         atr_sl_mult=atr_sl_mult, rr_targets=rr_targets
     )
-    volatility = _detect_volatility_regime(df)
 
     return SingleTFResult(
         symbol=symbol,
@@ -563,3 +683,66 @@ def build_single_result(df: pd.DataFrame, symbol: str, timeframe: str,
         support=levels["support"],
         resistance=levels["resistance"],
     )
+
+
+# ---------- هم‌نوایی زمینه‌ای (Context Confluence) - فاز ۱ تقویت موتور ----------
+
+def apply_context_confluence(result: SingleTFResult, higher_tf_info: dict = None,
+                              btc_corr_info: dict = None, order_book_info: dict = None) -> SingleTFResult:
+    """
+    اطلاعات زمینه‌ای (هم‌راستایی تایم‌فریم بالاتر، همبستگی BTC، فشار
+    اردربوک) که قبلاً فقط توی پیام نمایش داده می‌شدن رو به یه تعدیل روی
+    درصد اطمینان نهایی تبدیل می‌کنه. جهت سیگنال و سطوح ورود/SL/TP که از
+    قبل بر پایه‌ی خود موتور محاسبه شدن، دست‌نخورده می‌مونن - این تابع
+    فقط «چقدر بهش مطمئن باشیم» رو تعدیل می‌کنه.
+
+    نتیجه توی result.context_adjusted_confidence_percent ذخیره می‌شه؛
+    اگه هیچ‌کدام از سه ورودی موجود نبود، برابر confidence_percent اصلی می‌مونه.
+    """
+    from config import (
+        CONTEXT_HTF_ALIGN_BONUS, CONTEXT_HTF_CONFLICT_PENALTY,
+        CONTEXT_BTC_HIGH_CORR_PENALTY, CONTEXT_ORDERBOOK_BONUS, CONTEXT_ORDERBOOK_PENALTY,
+        ORDER_BOOK_IMBALANCE_THRESHOLD,
+    )
+
+    base = result.confidence_percent
+    if result.direction == "NEUTRAL":
+        result.context_adjusted_confidence_percent = base
+        return result
+
+    adjustment = 0
+    notes = []
+
+    if higher_tf_info:
+        if higher_tf_info["aligned"]:
+            if higher_tf_info["higher_tf_direction"] != "NEUTRAL":
+                adjustment += CONTEXT_HTF_ALIGN_BONUS
+                notes.append("هم‌جهت با تایم‌فریم بالاتر")
+        else:
+            adjustment -= CONTEXT_HTF_CONFLICT_PENALTY
+            notes.append("مخالف روند تایم‌فریم بالاتر")
+
+    if btc_corr_info and btc_corr_info.get("high_correlation"):
+        adjustment -= CONTEXT_BTC_HIGH_CORR_PENALTY
+        notes.append("همبستگی بالا با BTC (استقلال کمتر)")
+
+    if order_book_info:
+        bid_ratio = order_book_info["bid_ratio"]
+        book_supports_buy = bid_ratio >= ORDER_BOOK_IMBALANCE_THRESHOLD
+        book_supports_sell = bid_ratio <= (1 - ORDER_BOOK_IMBALANCE_THRESHOLD)
+        if result.direction == "BUY" and book_supports_buy:
+            adjustment += CONTEXT_ORDERBOOK_BONUS
+            notes.append("اردربوک هم‌جهت (فشار خرید)")
+        elif result.direction == "SELL" and book_supports_sell:
+            adjustment += CONTEXT_ORDERBOOK_BONUS
+            notes.append("اردربوک هم‌جهت (فشار فروش)")
+        elif result.direction == "BUY" and book_supports_sell:
+            adjustment -= CONTEXT_ORDERBOOK_PENALTY
+            notes.append("اردربوک مخالف (فشار فروش)")
+        elif result.direction == "SELL" and book_supports_buy:
+            adjustment -= CONTEXT_ORDERBOOK_PENALTY
+            notes.append("اردربوک مخالف (فشار خرید)")
+
+    result.context_adjusted_confidence_percent = max(0, min(100, base + adjustment))
+    result.context_notes = notes
+    return result
