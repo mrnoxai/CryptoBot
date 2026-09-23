@@ -7,6 +7,11 @@
 
 منطق برد/باخت دقیقاً هماهنگ با /mystats هست: TP1/TP2/TP3 برد، SL باخت،
 سربه‌سر نه برد حساب می‌شه نه باخت (فقط جدا نمایش داده می‌شه).
+
+---------- فاز ۲ تقویت موتور سیگنال: یادگیری از تاریخچه‌ی عملکرد سیگنال‌ها ----------
+علاوه بر تحلیل‌های نمایشی بالا، get_historical_performance برای موتور سیگنال اضافه شد
+تا نرخ برد تاریخی همون نماد+تایم‌فریم+جهت رو برای هم‌نوایی با apply_context_confluence
+برگردونه (فقط وقتی حداقل MIN_SAMPLES_FOR_CONFIDENCE نمونه قطعی موجود باشه).
 """
 from collections import defaultdict
 from datetime import datetime
@@ -83,3 +88,28 @@ async def analyze_by_direction(user_id: int = None) -> list[dict]:
 async def get_total_resolved_count(user_id: int = None) -> int:
     rows = await db.get_resolved_signals(user_id)
     return len(rows)
+
+
+async def get_historical_performance(symbol: str, timeframe: str, direction: str) -> dict | None:
+    """
+    نرخ برد تاریخی سیگنال‌های قبلی با دقیقاً همین نماد/تایم‌فریم/جهت - برای استفاده
+    در apply_context_confluence (فاز ۲). اگه تعداد نمونه‌های قطعی (برد+باخت) کمتر از
+    MIN_SAMPLES_FOR_CONFIDENCE باشه، None برمی‌گردونه (نتیجه‌گیری قابل‌اتکا نیست).
+    """
+    rows = await db.get_resolved_signals_for(symbol, timeframe, direction)
+    counts = {"win": 0, "loss": 0, "breakeven": 0}
+    for row in rows:
+        counts[_classify(row["status"])] += 1
+
+    decided = counts["win"] + counts["loss"]
+    if decided < MIN_SAMPLES_FOR_CONFIDENCE:
+        return None
+
+    win_rate = (counts["win"] / decided * 100) if decided > 0 else None
+    return {
+        "win_rate": win_rate,
+        "wins": counts["win"],
+        "losses": counts["loss"],
+        "breakeven": counts["breakeven"],
+        "sample_size": decided,
+    }
