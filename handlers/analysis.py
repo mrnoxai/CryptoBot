@@ -8,7 +8,7 @@ from single_analysis import (
     MIN_CANDLES_FOR_ANALYSIS, MIN_CANDLES_REQUIRED
 )
 from charts import generate_extended_chart
-from market_context import check_higher_timeframe_alignment, check_btc_correlation
+from market_context import check_higher_timeframe_alignment, check_second_higher_timeframe_alignment, check_btc_correlation
 from fundamentals import get_coin_fundamentals, get_market_fundamentals
 import database as db
 import analytics
@@ -42,7 +42,7 @@ def _result_keyboard(symbol: str, timeframe: str, pending_id: int = None) -> Inl
     buttons = [
         [
             InlineKeyboardButton("🔄 بروزرسانی", callback_data=f"tf:{symbol}:{timeframe}"),
-            InlineKeyboardButton("⏱ تغییر تایم‌فریم", callback_data=f"chtf:{symbol}"),
+            InlineKeyboardButton("⏱ تقییر تایم‌فریم", callback_data=f"chtf:{symbol}"),
         ],
         [
             InlineKeyboardButton("⭐ افزودن به واچ‌لیست", callback_data=f"watch:{symbol}"),
@@ -114,7 +114,8 @@ def _calc_position_size(risk_settings: dict, entry: float, sl: float, volatility
 
 def _format_single_result(result, higher_tf_info: dict = None, btc_corr_info: dict = None,
                            position_size: dict = None, order_book_info: dict = None,
-                           coin_fundamentals: dict = None, market_fundamentals: dict = None) -> str:
+                           coin_fundamentals: dict = None, market_fundamentals: dict = None,
+                           second_higher_tf_info: dict = None) -> str:
     meta = DIRECTION_META[result.direction]
     tf_label = TIMEFRAME_LABELS_FA.get(result.timeframe, result.timeframe)
     reason_icon = "✅" if result.direction == "BUY" else "❌"
@@ -144,7 +145,7 @@ def _format_single_result(result, higher_tf_info: dict = None, btc_corr_info: di
         "",
         f"💰 قیمت فعلی: ${_fmt_price(result.price)}",
         f"💧 نقدینگی (۲۴س): ${result.quote_volume_24h:,.0f} — {result.liquidity_level}",
-        f"{change_arrow} تغییر ۲۴ساعته: {result.price_change_24h_percent:+.2f}%",
+        f"{change_arrow} تفییر ۲۴ساعته: {result.price_change_24h_percent:+.2f}%",
         "",
         "📊 اندیکاتورها:",
         f"• RSI: {result.rsi:.2f}",
@@ -165,6 +166,14 @@ def _format_single_result(result, higher_tf_info: dict = None, btc_corr_info: di
         else:
             opp = "صعودی" if higher_tf_info["higher_tf_direction"] == "BUY" else "نزولی"
             context_lines.append(f"⚠️ روند تایم‌فریم {htf_label} مخالفه ({opp}) — احتیاط بیشتر")
+
+    if second_higher_tf_info:
+        htf2_label = TIMEFRAME_LABELS_FA.get(second_higher_tf_info["higher_tf"], second_higher_tf_info["higher_tf"])
+        if second_higher_tf_info["aligned"]:
+            context_lines.append(f"✅ هم‌جهت با روند تایم‌فریم {htf2_label}")
+        else:
+            opp2 = "صعودی" if second_higher_tf_info["higher_tf_direction"] == "BUY" else "نزولی"
+            context_lines.append(f"⚠️ روند تایم‌فریم {htf2_label} مخالفه ({opp2}) — احتیاط بیشتر")
 
     if btc_corr_info:
         corr_pct = btc_corr_info["correlation"] * 100
@@ -274,13 +283,13 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
             warn_text = (
                 f"⚠️ برای `{symbol}` روی تایم‌فریم {tf_label} فقط {len(df)} کندل تاریخچه "
                 f"در دسترسه (حداقل {MIN_CANDLES_REQUIRED} تا لازمه تا اندیکاتورها معتبر باشن).\n\n"
-                f"یه تایم‌فریم کوچیک‌تر امتحان کن یا از «⏱ تغییر تایم‌فریم» استفاده کن."
+                f"یه تایم‌فریم کوچیک‌تر امتحان کن یا از «⏱ تقییر تایم‌فریم» استفاده کن."
             )
             return warn_text, None, None
 
         df = add_extended_indicators(df)
 
-        # تنظیمات قابل تغییر از پنل وب (اگه ادمین چیزی تغییر نداده باشه، مقادیر پیش‌فرض استفاده می‌شن)
+        # تنظیمات قابل تفییر از پنل وب (اگه ادمین چیزی تفییر نداده باشه، مقادیر پیش‌فرض استفاده می‌شن)
         confidence_threshold = await db.get_float_setting("confidence_threshold_fraction", 0.25)
         atr_sl_mult = await db.get_float_setting("atr_sl_mult", 1.5)
         rr_targets_raw = await db.get_setting("rr_targets")
@@ -306,12 +315,17 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
             pass
 
         higher_tf_info = None
+        second_higher_tf_info = None
         btc_corr_info = None
         order_book_info = None
         historical_performance_info = None
         if result.direction != "NEUTRAL":
             try:
                 higher_tf_info = await check_higher_timeframe_alignment(client, symbol, timeframe, result.direction)
+            except Exception:
+                pass
+            try:
+                second_higher_tf_info = await check_second_higher_timeframe_alignment(client, symbol, timeframe, result.direction)
             except Exception:
                 pass
             try:
@@ -328,7 +342,10 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
             except Exception:
                 pass
 
-            result = apply_context_confluence(result, higher_tf_info, btc_corr_info, order_book_info, historical_performance_info)
+            result = apply_context_confluence(
+                result, higher_tf_info, btc_corr_info, order_book_info, historical_performance_info,
+                second_higher_tf_info=second_higher_tf_info,
+            )
 
         # فاندامنتال (منابع رایگان، best-effort - اگه در دسترس نبود، فقط حذف می‌شه از پیام)
         coin_fundamentals = None
@@ -361,9 +378,10 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
 
         text = _format_single_result(
             result, higher_tf_info, btc_corr_info, position_size,
-            order_book_info, coin_fundamentals, market_fundamentals
+            order_book_info, coin_fundamentals, market_fundamentals,
+            second_higher_tf_info=second_higher_tf_info,
         )
-        # اخبار مهم (اگه کاربر غیرفعال نکرده باشه) - خلاصه کوتاه زیر سیگنال
+        # اخبار مهم (اگه کاربر الزام نکرده) - خلاصه کوتاه زیر سیگنال
         if user_id is not None:
             try:
                 news_enabled = await db.get_user_news_enabled(user_id)
@@ -395,7 +413,7 @@ def _classify_liquidity(quote_volume_24h: float) -> str:
         return "بالا 🟢"
     if quote_volume_24h >= 5_000_000:
         return "متوسط 🟡"
-    return "پایین 🔴 (ریسک اسپرد/لغزش قیمت بیشتر)"
+    return "پایین 🔴 (ریسک اسپرد/لقزش قیمت بیشتر)"
 
 
 # ---------- دستورات ----------
