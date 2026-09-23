@@ -4,13 +4,14 @@ from telegram.constants import ParseMode
 from exchange import ExchangeClient, normalize_symbol
 from signals import analyze_symbol, SIGNAL_EMOJI, SIGNAL_FA
 from single_analysis import (
-    add_extended_indicators, build_single_result, TIMEFRAME_LABELS_FA,
+    add_extended_indicators, build_single_result, apply_context_confluence, TIMEFRAME_LABELS_FA,
     MIN_CANDLES_FOR_ANALYSIS, MIN_CANDLES_REQUIRED
 )
 from charts import generate_extended_chart
 from market_context import check_higher_timeframe_alignment, check_btc_correlation
 from fundamentals import get_coin_fundamentals, get_market_fundamentals
 import database as db
+import analytics
 
 
 # ---------- کیبوردهای شیشه‌ای ----------
@@ -126,11 +127,17 @@ def _format_single_result(result, higher_tf_info: dict = None, btc_corr_info: di
     else:
         trend_strength = f"ضعیف/رنج ({result.adx:.0f})"
 
+    displayed_confidence = (
+        result.context_adjusted_confidence_percent
+        if result.context_adjusted_confidence_percent is not None
+        else result.confidence_percent
+    )
+
     lines = [
         f"💎 {result.symbol}",
         f"{meta['emoji']} {meta['fa']}",
         f"🕰 تایم‌فریم: {tf_label}",
-        f"📊 اطمینان: {result.confidence_percent}% (امتیاز {result.score:+.1f} از {result.max_score:.0f})",
+        f"📊 اطمینان: {displayed_confidence}% (امتیاز {result.score:+.1f} از {result.max_score:.0f})",
         f"🧭 جهت: {meta['compass']}",
         f"💪 قدرت روند (ADX): {trend_strength}",
         f"🌪 نوسان بازار: {result.volatility_level}" + (f" (صدک {result.volatility_percentile:.0f})" if result.volatility_percentile is not None else ""),
@@ -178,6 +185,9 @@ def _format_single_result(result, higher_tf_info: dict = None, btc_corr_info: di
 
     if result.fib_confirmation:
         context_lines.append(f"🔢 حد ضرر {result.fib_confirmation} — اعتبار بیشتر")
+
+    if result.context_notes:
+        context_lines += result.context_notes
 
     if context_lines:
         lines += ["", "🌐 زمینه‌ی بازار:"] + [f"• {c}" for c in context_lines]
@@ -298,6 +308,7 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
         higher_tf_info = None
         btc_corr_info = None
         order_book_info = None
+        historical_performance_info = None
         if result.direction != "NEUTRAL":
             try:
                 higher_tf_info = await check_higher_timeframe_alignment(client, symbol, timeframe, result.direction)
@@ -312,6 +323,12 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
                 order_book_info = await client.fetch_order_book_imbalance(symbol, depth=ORDER_BOOK_DEPTH_LEVELS)
             except Exception:
                 pass
+            try:
+                historical_performance_info = await analytics.get_historical_performance(symbol, timeframe, result.direction)
+            except Exception:
+                pass
+
+            result = apply_context_confluence(result, higher_tf_info, btc_corr_info, order_book_info, historical_performance_info)
 
         # فاندامنتال (منابع رایگان، best-effort - اگه در دسترس نبود، فقط حذف می‌شه از پیام)
         coin_fundamentals = None
@@ -332,7 +349,7 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
             risk_settings = await db.get_user_risk(user_id)
             position_size = _calc_position_size(risk_settings, result.entry, result.sl, result.volatility_risk_mult)
 
-        await db.log_signal(symbol, result.direction, result.confidence_percent, result.price)
+        await db.log_signal(symbol, result.direction, result.context_adjusted_confidence_percent, result.price)
 
         # به‌جای ثبت خودکار برای پایش، فقط یه رکورد موقت می‌سازیم و از
         # کاربر با دکمه می‌پرسیم که واقعاً می‌خواد پیگیریش کنه یا نه
