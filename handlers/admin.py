@@ -175,7 +175,7 @@ async def botanalytics_command(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append(_fmt_group_line(s))
 
     lines.append(
-        "\nℹ️ آیتم‌های «نمونه‌ی کم» یعنی تعداد سیگنال‌های به‌نتیجه‌رسیده "
+        "\nℹ️ آیتم‌های «نمونه‌ی کم» یعنی تعداد برد+باخت نهایی، بدون سربه‌سر، "
         f"کمتر از {analytics.MIN_SAMPLES_FOR_CONFIDENCE} تا بوده."
     )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)

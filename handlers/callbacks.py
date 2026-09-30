@@ -14,10 +14,24 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     فرمت callback_data: "action:symbol" یا "action:symbol:timeframe"
     """
     query = update.callback_query
-    await query.answer()
-
     parts = query.data.split(":")
     action = parts[0]
+
+    # نتیجه‌ی پیگیری را خود handler فقط یک‌بار پاسخ می‌دهد.
+    if action in ("track", "notrack"):
+        try:
+            if len(parts) != 2:
+                raise ValueError("Invalid tracking callback")
+            pending_id = int(parts[1])
+            if not 0 < pending_id <= 9223372036854775807:
+                raise ValueError("Invalid pending id")
+        except ValueError:
+            await query.answer("درخواست پیگیری نامعتبر است.", show_alert=True)
+            return
+        await _handle_track_decision(query, pending_id, confirm=action == "track")
+        return
+
+    await query.answer()
 
     if action == "tf" and len(parts) == 3:
         _, symbol, timeframe = parts
@@ -63,12 +77,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"✅ `{symbol}` به واچ‌لیست اضافه شد.", parse_mode=ParseMode.MARKDOWN)
         else:
             await query.message.reply_text(f"ℹ️ `{symbol}` از قبل توی واچ‌لیستت بود.", parse_mode=ParseMode.MARKDOWN)
-
-    elif action == "track" and len(parts) == 2:
-        await _handle_track_decision(query, int(parts[1]), confirm=True)
-
-    elif action == "notrack" and len(parts) == 2:
-        await _handle_track_decision(query, int(parts[1]), confirm=False)
 
     elif action == "delsig" and len(parts) == 2:
         perf_id = int(parts[1])
@@ -130,26 +138,29 @@ async def _handle_access_decision(query, context, target_user_id: int, approve: 
 
 
 async def _handle_track_decision(query, pending_id: int, confirm: bool):
-    """کاربر با دکمه‌ی 📌/❌ تصمیمش رو درباره‌ی پیگیری یه سیگنال اعلام کرده"""
-    pending = await db.get_pending_signal(pending_id)
-    if not pending:
-        await query.answer("این درخواست منقضی شده (بیش از ۲۴ ساعت گذشته).", show_alert=True)
+    """تصمیم اتمیک و پاسخ واحد؛ پاسخ تلگرام بعد از پایان تراکنش ارسال می‌شود."""
+    import aiosqlite
+    import logging
+    try:
+        result = await db.decide_pending_signal(pending_id, query.from_user.id, confirm)
+    except aiosqlite.Error:
+        logging.getLogger("handlers.callbacks").exception("خطای دیتابیس در تصمیم پیگیری %s", pending_id)
+        await query.answer("خطای دیتابیس در ثبت تصمیم؛ کمی بعد دوباره تلاش کن.", show_alert=True)
         return
 
-    if pending["user_id"] != query.from_user.id:
-        await query.answer("این دکمه مال تو نیست.", show_alert=True)
+    outcome = result["outcome"]
+    messages = {
+        "accepted": "✅ در انتظار ورود فرضی ثبت شد، نه اجرای سفارش واقعی. وضعیت: /mystats و /mysignals",
+        "declined": "باشه، این سیگنال پیگیری نمی‌شه.",
+        "expired": "این درخواست منقضی شده (۲۴ ساعت از ثبت گذشته). دوباره سیگنال بگیر.",
+        "invalid_timestamp": "زمان ثبت این درخواست معتبر نیست؛ دوباره سیگنال بگیر.",
+        "missing": "این درخواست دیگر موجود نیست؛ ممکن است قبلاً رسیدگی یا حذف شده باشد.",
+        "forbidden": "این دکمه مال تو نیست.",
+        "invalid": "قیمت ورود یا حد ضرر این سیگنال معتبر نیست؛ دوباره تحلیل بگیر.",
+    }
+    await query.answer(messages[outcome], show_alert=True)
+    if outcome not in ("accepted", "declined", "expired", "invalid_timestamp"):
         return
-
-    if confirm:
-        await db.record_signal_performance(
-            pending["user_id"], pending["symbol"], pending["timeframe"], pending["direction"],
-            pending["entry"], pending["sl"], [pending["tp1"], pending["tp2"], pending["tp3"]]
-        )
-        await db.delete_pending_signal(pending_id)
-        await query.answer("✅ ثبت شد. با /mystats و /mysignals می‌تونی پیگیریش کنی.", show_alert=True)
-    else:
-        await db.delete_pending_signal(pending_id)
-        await query.answer("باشه، این سیگنال پیگیری نمی‌شه.", show_alert=True)
 
     # ردیف دکمه‌های پیگیری رو از کیبورد پیام اصلی حذف می‌کنیم (تصمیم گرفته شده)
     try:

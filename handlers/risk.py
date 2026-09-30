@@ -64,12 +64,12 @@ async def myrisk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """آمار عملکرد سیگنال‌هایی که این کاربر از /signal گرفته (چندتا به TP رسیدن، چندتا SL خوردن)"""
+    """نرخ برد نتایج نهایی و وضعیت اهداف میانیِ سیگنال‌های پیگیری‌شده."""
     user_id = update.effective_user.id
     stats = await db.get_user_performance_stats(user_id)
 
-    total_resolved = stats["closed"] + stats["breakeven"]
-    if total_resolved == 0 and stats["open"] == 0:
+    total_resolved = stats["resolved"]
+    if total_resolved == 0 and stats["monitored"] == 0 and stats["invalidated"] == 0:
         await update.message.reply_text(
             "هنوز سیگنالی برات ثبت نشده. بعد از گرفتن اولین سیگنال از `/signal`، "
             "می‌تونی وضعیتش رو اینجا پیگیری کنی."
@@ -78,34 +78,48 @@ async def mystats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📊 *آمار عملکرد سیگنال‌های تو:*", ""]
     if stats["win_rate"] is not None:
-        lines.append(f"نرخ برد: *{stats['win_rate']:.0f}%* ({stats['wins']} برد / {stats['losses']} باخت)")
+        lines.append(f"نرخ برد نهایی: *{stats['win_rate']:.0f}%* ({stats['wins']} برد / {stats['losses']} باخت؛ سربه‌سر خارج از نرخ برد)")
     elif total_resolved > 0:
         lines.append(f"همه‌ی {total_resolved} سیگنال به‌نتیجه‌رسیده تا الان سربه‌سر بسته شدن (نه برد، نه باخت).")
     else:
-        lines.append("هنوز هیچ سیگنالی به TP یا SL نرسیده (همه در حال پایشن).")
+        lines.append("هنوز هیچ سیگنالی به نتیجه‌ی نهایی نرسیده؛ TP1/TP2 پیشرفت هستند، نه برد نهایی.")
 
-    lines.append(f"🟢 برخورد به تارگت: {stats['wins']}")
-    lines.append(f"🔴 برخورد به حد ضرر: {stats['losses']}")
+    lines.append(f"🟢 برد نهایی (TP3): {stats['wins']}")
+    lines.append(f"🔴 باخت نهایی (SL): {stats['losses']}")
     if stats["breakeven"]:
         lines.append(f"⚪️ بسته‌شده سربه‌سر (بعد از TP1): {stats['breakeven']}")
     lines.append(f"⏳ در حال پایش (باز): {stats['open']}")
+    lines.append(f"⌛ در انتظار ورود فرضی: {stats['waiting']}")
+    if stats["invalidated"]:
+        lines.append(f"🚫 باطل‌شده پیش از ورود: {stats['invalidated']} (خارج از نرخ برد)")
+    progress = stats["target_progress"]
+    lines += [
+        "",
+        "🎯 *وضعیت اهداف — جدا از نرخ برد:*",
+        f"• در TP1 و هنوز باز: {progress['TP1_HIT']}",
+        f"• در TP2 و هنوز باز: {progress['TP2_HIT']}",
+        f"• بسته‌شده در TP3: {progress['TP3_HIT']}",
+        "ℹ️ این اعداد بر اساس آخرین وضعیت ثبت‌شده‌اند، نه سابقه‌ی تمام لمس‌های هدف.",
+    ]
 
     breakdown = stats["breakdown"]
     detail_map = {
-        "TP1_HIT": "رسیده به TP1", "TP2_HIT": "رسیده به TP2", "TP3_HIT": "رسیده به TP3",
+        "TP1_HIT": "رسیده به TP1 (هنوز باز)", "TP2_HIT": "رسیده به TP2 (هنوز باز)", "TP3_HIT": "بسته‌شده در TP3",
         "SL_HIT": "خورده به SL", "BREAKEVEN_HIT": "سربه‌سر بسته شده", "OPEN": "باز",
+        "WAITING_ENTRY": "در انتظار ورود فرضی", "ENTRY_INVALIDATED": "باطل پیش از ورود",
     }
     detail_lines = [f"• {detail_map.get(k, k)}: {v}" for k, v in breakdown.items() if k in detail_map]
     if detail_lines:
         lines += ["", "جزئیات:"] + detail_lines
 
-    lines.append("\nℹ️ وضعیت هر سیگنال به‌صورت خودکار هر ۱۰ دقیقه چک می‌شه و اگه به TP/SL برسه، بهت پیام می‌دم.")
-    lines.append("برای دیدن و مدیریت لیست سیگنال‌های فعال: /mysignals")
+    lines.append("\nℹ️ هر ۱۰ دقیقه یک دستهٔ چرخشی تا سقف ۲۰۰ سیگنال پایش می‌شود؛ با صف بزرگ‌تر، فاصلهٔ بررسی هر سیگنال طولانی‌تر است. لمس‌های بین بررسی‌ها ممکن است دیده نشوند؛ ورود فرضی اجرای سفارش واقعی نیست.")
+    lines.append("برای دیدن و مدیریت لیست سیگنال‌های در پایش: /mysignals")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 STATUS_FA = {
-    "OPEN": "باز — هنوز به هیچ سطحی نرسیده",
+    "WAITING_ENTRY": "در انتظار ورود فرضی — هنوز معامله‌ی فعال نیست",
+    "OPEN": "باز در مدل پایش — هنوز به هیچ هدفی نرسیده",
     "TP1_HIT": "رسیده به TP1 ✅",
     "TP2_HIT": "رسیده به TP2 ✅✅",
 }
@@ -113,7 +127,7 @@ STATUS_FA = {
 
 async def mysignals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    لیست سیگنال‌های فعال (پیگیری‌شده) کاربر، هرکدوم با دکمه‌ی حذف
+    لیست سیگنال‌های در انتظار ورود یا فعال در پایش کاربر، با دکمه‌ی حذف
     جداگانه - چون هر سیگنال پیام جدای خودش رو داره، حذف یکی تاثیری
     روی بقیه نمی‌ذاره.
     """
@@ -124,23 +138,31 @@ async def mysignals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not signals:
         await update.message.reply_text(
-            "هیچ سیگنال فعالی نداری. وقتی از `/signal` سیگنال می‌گیری و "
+            "هیچ سیگنالی در پایش نداری. وقتی از `/signal` سیگنال می‌گیری و "
             "دکمه‌ی «📌 پیگیری این سیگنال» رو می‌زنی، اینجا لیست می‌شه.",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    await update.message.reply_text(f"📋 *{len(signals)} سیگنال فعال داری:*", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"📋 *{len(signals)} سیگنال در پایش داری:*", parse_mode=ParseMode.MARKDOWN)
 
     for sig in signals:
         emoji = "🟢" if sig["direction"] == "BUY" else "🔴"
         status_text = STATUS_FA.get(sig["status"], sig["status"])
         text = (
             f"{emoji} *{sig['symbol']}* ({sig['timeframe']}) — {sig['direction']}\n"
-            f"ورود: `{sig['entry']:,.4f}` | SL: `{sig['sl']:,.4f}`\n"
+            f"Entry برنامه‌ریزی‌شده: `{sig['entry']:,.4f}` | SL: `{sig['sl']:,.4f}`\n"
             f"وضعیت: {status_text}\n"
             f"ثبت‌شده: {sig['created_at'][:10]}"
         )
+        if sig["entry_triggered_at"] is not None:
+            text += (
+                f"\nفعال‌سازی فرضی در UTC: {sig['entry_triggered_at']}"
+                f"\nقیمت مشاهده‌شده: `{sig['entry_observed_price']:,.4f}`"
+                "\nاین ثبت، تأیید اجرای سفارش واقعی نیست."
+            )
+        elif sig["status"] != "WAITING_ENTRY":
+            text += "\nرکورد قدیمی: زمان/قیمت مشاهده‌ی ورود ثبت نشده؛ وضعیت قبلی حفظ شده است."
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("🗑 حذف از پایش", callback_data=f"delsig:{sig['id']}")
         ]])
@@ -152,7 +174,7 @@ def _fmt_group_line(stat: dict) -> str:
     wr_txt = f"{stat['win_rate']:.0f}%" if stat["win_rate"] is not None else "-"
     breakeven_txt = f" | سربه‌سر: {stat['breakeven']}" if stat["breakeven"] else ""
     sample_note = " (نمونه‌ی کم ⚠️)" if stat["low_sample"] else ""
-    return f"{icon} *{stat['key']}*: برد {wr_txt} ({stat['wins']}✅/{stat['losses']}❌{breakeven_txt}){sample_note}"
+    return f"{icon} *{stat['key']}*: برد نهایی {wr_txt} ({stat['wins']}✅/{stat['losses']}❌{breakeven_txt}){sample_note}"
 
 
 async def myanalytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,7 +189,7 @@ async def myanalytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if total == 0:
         await update.message.reply_text(
             "هنوز سیگنال به‌نتیجه‌رسیده‌ای نداری که بشه ازش الگو استخراج کرد. "
-            "بعد از چند سیگنال پیگیری‌شده (`/signal` → پیگیری → رسیدن به TP/SL)، "
+            "بعد از چند سیگنال پیگیری‌شده (`/signal` → پیگیری → بسته‌شدن در TP3/SL/سربه‌سر)، "
             "اینجا برات الگو نشون می‌دم."
         )
         return
@@ -196,7 +218,7 @@ async def myanalytics_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append(f"\n💡 تایم‌فریم *{best_tf['key']}* برات بهتر از *{worst_tf['key']}* جواب داده.")
 
     lines.append(
-        "\nℹ️ آیتم‌های «نمونه‌ی کم» یعنی تعداد سیگنال‌های به‌نتیجه‌رسیده "
+        "\nℹ️ آیتم‌های «نمونه‌ی کم» یعنی تعداد برد+باخت نهایی، بدون سربه‌سر، "
         f"کمتر از {analytics.MIN_SAMPLES_FOR_CONFIDENCE} تا بوده - هنوز برای نتیجه‌گیری قطعی زوده."
     )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
