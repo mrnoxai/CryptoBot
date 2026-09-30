@@ -112,12 +112,17 @@ def _simulate_trade(df: pd.DataFrame, entry_idx: int, direction: str, entry: flo
     """
     شبیه‌سازی یه معامله از کندل entry_idx به بعد.
     خروجی: (r_multiple, exit_reason, exit_price, exit_time, exit_index)
+    R از سود/ضرر جهت‌دار نسبت به فاصله‌ی ورود واقعی تا SL اولیه محاسبه می‌شه.
     """
     n = len(df)
     end_idx = min(entry_idx + max_hold, n - 1)
     risk = abs(entry - sl)
     if risk == 0:
         return 0.0, "STILL_OPEN", entry, df.iloc[entry_idx]["timestamp"], entry_idx
+
+    def r_at(exit_price: float) -> float:
+        pnl = exit_price - entry if direction == "BUY" else entry - exit_price
+        return pnl / risk
 
     best_level = 0  # 0=هیچی، 1=TP1، 2=TP2
 
@@ -138,9 +143,9 @@ def _simulate_trade(df: pd.DataFrame, entry_idx: int, direction: str, entry: flo
 
         # فرض محافظه‌کارانه: اگه SL و TP توی یه کندل با هم لمس بشن، SL مقدمه
         if hit_sl:
-            return -1.0, "SL", sl, row["timestamp"], j
+            return r_at(sl), "SL", sl, row["timestamp"], j
         if hit_tp3:
-            return 3.0, "TP3", tps[2], row["timestamp"], j
+            return r_at(tps[2]), "TP3", tps[2], row["timestamp"], j
         if hit_tp2:
             best_level = max(best_level, 2)
         elif hit_tp1:
@@ -151,15 +156,15 @@ def _simulate_trade(df: pd.DataFrame, entry_idx: int, direction: str, entry: flo
     is_data_end = end_idx == n - 1
 
     if best_level == 2:
-        r = abs(tps[1] - entry) / risk
+        r = r_at(tps[1])
         return r, ("STILL_OPEN" if is_data_end else "TP2_TIMEOUT"), tps[1], last_row["timestamp"], end_idx
     if best_level == 1:
-        r = abs(tps[0] - entry) / risk
+        r = r_at(tps[0])
         return r, ("STILL_OPEN" if is_data_end else "TP1_TIMEOUT"), tps[0], last_row["timestamp"], end_idx
 
     # نه SL نه هیچ TP - مارک‌تومارکت با آخرین قیمت بسته‌شدن
     last_close = float(last_row["close"])
-    signed_r = (last_close - entry) / risk if direction == "BUY" else (entry - last_close) / risk
+    signed_r = r_at(last_close)
     reason = "STILL_OPEN" if is_data_end else "TIMEOUT"
     return signed_r, reason, last_close, last_row["timestamp"], end_idx
 

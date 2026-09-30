@@ -3,12 +3,18 @@
 از aiosqlite استفاده می‌کنیم چون ربات async هست
 """
 import aiosqlite
-from datetime import datetime, timedelta
+import json
+import logging
+import math
+from datetime import datetime, timedelta, timezone
 from config import DB_PATH
+
+logger = logging.getLogger(__name__)
+MONITOR_QUEUE_STATE_KEY = "_signal_performance_queue"
 
 
 async def init_db():
-    """ساخت جداول در صورت عدم وجود"""
+    """ساخت جداول و مهاجرت افزایشی ستون‌های پایش، بدون بازنویسی رکوردها."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -87,9 +93,19 @@ async def init_db():
                 tp3 REAL,
                 status TEXT DEFAULT 'OPEN',
                 created_at TEXT,
-                closed_at TEXT
+                closed_at TEXT,
+                entry_triggered_at TEXT,
+                entry_observed_price REAL
             )
         """)
+        # مهاجرت افزایشی؛ وضعیت/قیمت رکوردهای قدیمی را بازنویسی نمی‌کنیم.
+        cursor = await db.execute("PRAGMA table_info(signal_performance)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        for name, sql_type in (
+            ("entry_triggered_at", "TEXT"), ("entry_observed_price", "REAL")
+        ):
+            if name not in columns:
+                await db.execute(f"ALTER TABLE signal_performance ADD COLUMN {name} {sql_type}")
         # سیگنال‌هایی که منتظر تاییدیه‌ی کاربرن (بله/خیر پیگیری شه)؛ بعد
         # از پاسخ کاربر، یا به signal_performance منتقل می‌شن یا حذف می‌شن
         await db.execute("""
@@ -254,6 +270,80 @@ async def is_user_blocked(user_id: int) -> bool:
         return await cursor.fetchone() is not None
 
 
+async def get_background_notification_recipients(user_ids, kind: str,
+                                                 symbol: str | None = None) -> set[int]:
+    """
+    سیاست مشترک اعلان پس‌زمینه؛ هر SELECT سیاست و تنظیمات را با هم می‌خواند.
+    مسدودی بر نقش ادمین/لیست‌سفید اولویت دارد. نبود سیاست = open؛ مقدار
+    ناشناس/NULL برای غیرادمین مجوز نیست. خطای DB به caller منتقل می‌شود
+    تا به‌جای fallback مجاز، ارسال را متوقف کند. نتایج کش نمی‌شوند.
+    """
+    preferences = {
+        "performance": "1",
+        "scan": """EXISTS (SELECT 1 FROM users u
+                          WHERE u.user_id = r.user_id AND u.auto_scan_enabled = 1)""",
+        # enabled فقط نمایش زیر سیگنال است، نه کلید ارسال خبر خودکار.
+        "news": """EXISTS (SELECT 1 FROM user_news_settings n
+                          WHERE n.user_id = r.user_id AND n.auto_enabled = 1)""",
+        "backup": "r.is_admin = 1",
+    }
+    if kind not in preferences:
+        return set()
+    ids = list(dict.fromkeys(
+        uid for uid in user_ids
+        if type(uid) is int and 0 < uid <= 9223372036854775807
+    ))
+    if not ids:
+        return set()
+    from config import ADMIN_IDS
+    admins = set(ADMIN_IDS)
+    condition = preferences[kind]
+    check_watch = kind == "scan" and symbol is not None
+    if check_watch:
+        condition += """ AND EXISTS (SELECT 1 FROM watchlist w
+                                    WHERE w.user_id = r.user_id AND w.symbol = ?)"""
+    allowed = set()
+    async with aiosqlite.connect(DB_PATH) as connection:
+        # دو پارامتر برای هر گیرنده؛ زیر سقف قدیمی ۹۹۹ پارامتر SQLite.
+        for offset in range(0, len(ids), 400):
+            chunk = ids[offset:offset + 400]
+            values = ",".join("(?, ?)" for _ in chunk)
+            params = [value for uid in chunk for value in (uid, int(uid in admins))]
+            if check_watch:
+                params.append(symbol)
+            cursor = await connection.execute(
+                f"""WITH recipients(user_id, is_admin) AS (VALUES {values}),
+                    policy(mode) AS (
+                        SELECT value FROM bot_settings WHERE key = 'access_mode'
+                        UNION ALL
+                        SELECT 'open' WHERE NOT EXISTS (
+                            SELECT 1 FROM bot_settings WHERE key = 'access_mode'
+                        )
+                    )
+                    SELECT r.user_id FROM recipients r CROSS JOIN policy p
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM blocked_users b WHERE b.user_id = r.user_id
+                    )
+                    AND (
+                        r.is_admin = 1 OR p.mode = 'open'
+                        OR (p.mode = 'whitelist' AND EXISTS (
+                            SELECT 1 FROM whitelist_users w WHERE w.user_id = r.user_id
+                        ))
+                    )
+                    AND ({condition})""",
+                params
+            )
+            allowed.update(row[0] for row in await cursor.fetchall())
+    return allowed
+
+
+async def can_receive_background_notification(user_id: int, kind: str,
+                                               symbol: str | None = None) -> bool:
+    """بررسی تازه پیش از ارسال؛ تراکنش مشترک با شبکه/تلگرام ایجاد نمی‌کند."""
+    allowed = await get_background_notification_recipients([user_id], kind, symbol)
+    return type(user_id) is int and user_id in allowed
+
+
 async def get_blocked_users() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
@@ -324,34 +414,92 @@ async def get_user_risk(user_id: int) -> dict | None:
 
 # ==================== پایش عملکرد سیگنال‌ها ====================
 
-async def record_signal_performance(user_id: int, symbol: str, timeframe: str, direction: str,
-                                     entry: float, sl: float, tps: list) -> int:
-    """ثبت یه سیگنال تازه‌صادرشده برای پایش بعدی؛ آی‌دی ردیف رو برمی‌گردونه"""
+def is_valid_price(price) -> bool:
+    """قیمت عددیِ مثبت و متناهی؛ داده‌ی نامعتبر وارد مدل پایش نشود."""
+    try:
+        return not isinstance(price, bool) and math.isfinite(price) and price > 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+async def _insert_signal_performance(connection, user_id: int, symbol: str, timeframe: str,
+                                     direction: str, entry: float, sl: float, tps: list) -> int:
+    """درج بدون commit؛ مالک تراکنش، ثبت و rollback را کنترل می‌کند."""
+    if (
+        direction not in ("BUY", "SELL")
+        or not is_valid_price(entry)
+        or not is_valid_price(sl)
+        or (direction == "BUY" and sl >= entry)
+        or (direction == "SELL" and sl <= entry)
+    ):
+        raise ValueError("Invalid direction, entry or stop-loss geometry")
     tp1 = tps[0] if len(tps) > 0 else None
     tp2 = tps[1] if len(tps) > 1 else None
     tp3 = tps[2] if len(tps) > 2 else None
+    cursor = await connection.execute(
+        """INSERT INTO signal_performance
+           (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'WAITING_ENTRY', ?)""",
+        (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, datetime.utcnow().isoformat())
+    )
+    return cursor.lastrowid
+
+
+async def record_signal_performance(user_id: int, symbol: str, timeframe: str, direction: str,
+                                     entry: float, sl: float, tps: list) -> int:
+    """ثبت مستقل در انتظار ورود؛ تایید pending باید از decide_pending_signal بگذرد."""
+    async with aiosqlite.connect(DB_PATH) as connection:
+        perf_id = await _insert_signal_performance(
+            connection, user_id, symbol, timeframe, direction, entry, sl, tps
+        )
+        await connection.commit()
+        return perf_id
+
+
+async def activate_signal_entry(perf_id: int, observed_price: float) -> bool:
+    """ورود فرضی با مشاهده‌ی قیمت در محدوده؛ تنها یک بار و به‌صورت اتمیک."""
+    if not is_valid_price(observed_price):
+        return False
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            """INSERT INTO signal_performance
-               (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)""",
-            (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, datetime.utcnow().isoformat())
+            """UPDATE signal_performance
+               SET status = 'OPEN', entry_triggered_at = :observed_at,
+                   entry_observed_price = :price
+               WHERE id = :id AND status = 'WAITING_ENTRY'
+                 AND ((direction = 'BUY' AND sl < entry AND :price <= entry AND :price > sl)
+                   OR (direction = 'SELL' AND sl > entry AND :price >= entry AND :price < sl))""",
+            {"id": perf_id, "price": observed_price, "observed_at": datetime.utcnow().isoformat()}
         )
         await db.commit()
-        return cursor.lastrowid
+        return cursor.rowcount == 1
+
+
+async def invalidate_waiting_entry(perf_id: int, observed_price: float) -> bool:
+    """مشاهده‌ی SL قبل از ورود: پایان پایش، بدون ثبت برد/باخت معامله."""
+    if not is_valid_price(observed_price):
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """UPDATE signal_performance
+               SET status = 'ENTRY_INVALIDATED', closed_at = :observed_at
+               WHERE id = :id AND status = 'WAITING_ENTRY'
+                 AND ((direction = 'BUY' AND sl < entry AND :price <= sl)
+                   OR (direction = 'SELL' AND sl > entry AND :price >= sl))""",
+            {"id": perf_id, "price": observed_price, "observed_at": datetime.utcnow().isoformat()}
+        )
+        await db.commit()
+        return cursor.rowcount == 1
 
 
 async def get_open_signal_performances(limit: int = 200) -> list[dict]:
     """
-    سیگنال‌هایی که هنوز به وضعیت نهایی (TP3 یا SL) نرسیدن - شامل سیگنال‌های
-    OPEN و همچنین اون‌هایی که فقط TP1/TP2 خوردن (چون هنوز ممکنه به سطح
-    بعدی برسن یا برگردن بخورن به SL، پس باید همچنان پایش بشن)
+    سیگنال‌های در انتظار ورود و فعال؛ ابطال پیش از ورود از پایش خارج است.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """SELECT id, user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, status
                FROM signal_performance
-               WHERE status NOT IN ('TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT')
+               WHERE status NOT IN ('TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT', 'ENTRY_INVALIDATED')
                ORDER BY id ASC LIMIT ?""",
             (limit,)
         )
@@ -360,8 +508,175 @@ async def get_open_signal_performances(limit: int = 200) -> list[dict]:
         return [dict(zip(cols, r)) for r in rows]
 
 
+def _parse_monitor_queue_state(raw, max_sequence: int) -> dict | None:
+    """نسخه/نوع/بازه‌ی نشانگر داخلی؛ سقف چرخه باید شناسه‌ی قبلاً ساخته‌شده باشد."""
+    try:
+        state = json.loads(raw)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if (
+        type(state) is not dict
+        or set(state) != {"version", "last_id", "upper_id"}
+        or type(state["version"]) is not int or state["version"] != 1
+        or type(state["last_id"]) is not int
+        or type(state["upper_id"]) is not int
+        or not 0 <= state["last_id"] <= state["upper_id"] <= 9223372036854775807
+        or state["upper_id"] == 0
+        or state["upper_id"] > max_sequence
+    ):
+        return None
+    return state
+
+
+async def claim_signal_performance_batch(limit: int = 200) -> list[dict]:
+    """
+    رزرو دسته‌ی بعدیِ چرخه‌ی محدود؛ نشانگر، انتخاب برای تلاش است نه موفقیت پایش.
+    سقف شناسه‌ی چرخه ثابت می‌ماند تا ورود مداوم داده چرخه را تمدید نکند.
+    نشانگر با انتخاب دسته در یک تراکنش ذخیره می‌شود؛ شبکه خارج تراکنش است.
+    read-only قدیمی و وضعیت/SL/سوابق سیگنال‌ها توسط این تابع تغییر نمی‌کنند.
+    """
+    if type(limit) is not int or not 0 < limit <= 9223372036854775807:
+        raise ValueError("Monitoring batch limit must be a positive SQLite integer")
+    eligible = "status NOT IN ('TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT', 'ENTRY_INVALIDATED')"
+    select_batch = f"""SELECT id, user_id, symbol, timeframe, direction,
+                             entry, sl, tp1, tp2, tp3, status
+                      FROM signal_performance
+                      WHERE {eligible} AND id > ? AND id <= ?
+                      ORDER BY id ASC LIMIT ?"""
+    async with aiosqlite.connect(DB_PATH) as connection:
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                "SELECT value FROM bot_settings WHERE key = ?", (MONITOR_QUEUE_STATE_KEY,)
+            )
+            saved = await cursor.fetchone()
+            cursor = await connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'signal_performance'"
+            )
+            sequence = await cursor.fetchone()
+            max_sequence = sequence[0] if sequence is not None else 0
+            state = _parse_monitor_queue_state(saved["value"], max_sequence) if saved is not None else None
+            if saved is not None and state is None:
+                logger.warning("نشانگر صف پایش نامعتبر است؛ چرخه از ابتدا شروع می‌شود.")
+            rows = []
+            if state is not None:
+                cursor = await connection.execute(
+                    select_batch, (state["last_id"], state["upper_id"], limit)
+                )
+                rows = await cursor.fetchall()
+            if not rows:
+                cursor = await connection.execute(
+                    f"SELECT MAX(id) FROM signal_performance WHERE {eligible}"
+                )
+                upper_id = (await cursor.fetchone())[0]
+                if upper_id is None:
+                    await connection.rollback()
+                    return []
+                state = {"version": 1, "last_id": 0, "upper_id": upper_id}
+                cursor = await connection.execute(select_batch, (0, upper_id, limit))
+                rows = await cursor.fetchall()
+            if not rows:
+                await connection.rollback()
+                return []
+
+            state["last_id"] = rows[-1]["id"]
+            cursor = await connection.execute(
+                """INSERT INTO bot_settings(key,value) VALUES (?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (MONITOR_QUEUE_STATE_KEY, json.dumps(state, separators=(",", ":")))
+            )
+            if cursor.rowcount != 1:
+                raise aiosqlite.IntegrityError("Monitoring batch cursor was not saved")
+            await connection.commit()
+            return [dict(row) for row in rows]
+        except BaseException:
+            await connection.rollback()
+            raise
+
+
+async def advance_signal_performance(perf_id: int, observed_price: float,
+                                     breakeven_enabled: bool = True) -> dict | None:
+    """
+    گذار اتمیک سیگنال فعال با وضعیت/SL تازه؛ قیمت‌گیری خارج تراکنش انجام می‌شود.
+    status، sl و closed_at با یک UPDATE و یک commit ثبت می‌شوند.
+    فقط نتیجه‌ی commit‌شده برمی‌گردد؛ None یعنی هیچ گذار جدیدی ثبت نشده است.
+    انتظار ورود، وضعیت نهایی و داده‌ی ناسازگار خودکار بازنویسی نمی‌شوند.
+    """
+    if not is_valid_price(observed_price):
+        return None
+    order = {"OPEN": 0, "TP1_HIT": 1, "TP2_HIT": 2}
+    async with aiosqlite.connect(DB_PATH) as connection:
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                "SELECT * FROM signal_performance WHERE id = ?", (perf_id,)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await connection.rollback()
+                return None
+            signal = dict(row)
+            if (
+                signal["status"] not in order
+                or signal["closed_at"] is not None
+                or signal["direction"] not in ("BUY", "SELL")
+                or not is_valid_price(signal["entry"])
+                or not is_valid_price(signal["sl"])
+            ):
+                await connection.rollback()
+                return None
+
+            is_buy = signal["direction"] == "BUY"
+            is_breakeven = abs(signal["sl"] - signal["entry"]) < 1e-9
+            at_stop = observed_price <= signal["sl"] if is_buy else observed_price >= signal["sl"]
+            candidate = None
+            if at_stop:
+                candidate = "BREAKEVEN_HIT" if is_breakeven else "SL_HIT"
+            else:
+                for level, status in (("tp3", "TP3_HIT"), ("tp2", "TP2_HIT"), ("tp1", "TP1_HIT")):
+                    target = signal[level]
+                    if is_valid_price(target) and (
+                        observed_price >= target if is_buy else observed_price <= target
+                    ):
+                        candidate = status
+                        break
+
+            terminal = candidate in ("TP3_HIT", "SL_HIT", "BREAKEVEN_HIT")
+            if candidate is None or (
+                not terminal and order[candidate] <= order[signal["status"]]
+            ):
+                await connection.rollback()
+                return None
+            move_sl = (
+                candidate in ("TP1_HIT", "TP2_HIT")
+                and breakeven_enabled
+                and not is_breakeven
+            )
+            new_sl = signal["entry"] if move_sl else signal["sl"]
+            closed_at = datetime.utcnow().isoformat() if terminal else None
+            cursor = await connection.execute(
+                """UPDATE signal_performance
+                   SET status = ?, sl = ?, closed_at = ?
+                   WHERE id = ? AND status = ? AND closed_at IS NULL""",
+                (candidate, new_sl, closed_at, perf_id, signal["status"])
+            )
+            if cursor.rowcount != 1:
+                raise aiosqlite.IntegrityError("Active signal transition was not updated")
+            await connection.commit()
+            return {
+                **signal, "previous_status": signal["status"], "status": candidate,
+                "sl": new_sl, "closed_at": closed_at, "breakeven_changed": bool(move_sl),
+            }
+        except BaseException:
+            await connection.rollback()
+            raise
+
+
 async def close_signal_performance(perf_id: int, status: str):
     """برای وضعیت‌های نهایی (TP3_HIT یا SL_HIT یا BREAKEVEN_HIT) - closed_at رو هم ثبت می‌کنه"""
+    # تابع خام برای سازگاری/fixture؛ مسیر پایش باید advance_signal_performance باشد.
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE signal_performance SET status = ?, closed_at = ? WHERE id = ?",
@@ -372,6 +687,7 @@ async def close_signal_performance(perf_id: int, status: str):
 
 async def update_signal_status(perf_id: int, status: str):
     """برای وضعیت‌های میانی (TP1_HIT/TP2_HIT) - سیگنال هنوز باز می‌مونه، closed_at خالی می‌مونه"""
+    # تابع خام؛ جایگزین تراکنش گذارِ پایش نیست.
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE signal_performance SET status = ? WHERE id = ?",
@@ -382,9 +698,9 @@ async def update_signal_status(perf_id: int, status: str):
 
 async def move_sl_to_breakeven(perf_id: int, entry: float):
     """
-    بعد از رسیدن به TP1، حد ضرر رو به نقطه‌ی ورود (سربه‌سر) منتقل می‌کنه
-    تا ریسک این معامله از این لحظه به بعد صفر بشه. خود ستون status
-    دست‌نخورده می‌مونه (همون TP1_HIT)؛ فقط sl تغییر می‌کنه.
+    بعد از TP1 یا عبور مستقیم به TP2، SL مدل پایش را به Entry منتقل می‌کند.
+    status تغییر نمی‌کند؛ سفارش واقعی و کارمزد/لغزش مدیریت نمی‌شوند.
+    تابع خام برای سازگاری؛ پایش زنده از advance_signal_performance استفاده می‌کند.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -395,6 +711,7 @@ async def move_sl_to_breakeven(perf_id: int, entry: float):
 
 
 async def get_user_performance_stats(user_id: int) -> dict:
+    """آمار نتایج نهایی؛ پیشرفت اهداف میانی جداست و همچنان باز محسوب می‌شه."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT status, COUNT(*) FROM signal_performance WHERE user_id = ? GROUP BY status",
@@ -402,30 +719,47 @@ async def get_user_performance_stats(user_id: int) -> dict:
         )
         rows = await cursor.fetchall()
         counts = {status: count for status, count in rows}
-        wins = counts.get("TP1_HIT", 0) + counts.get("TP2_HIT", 0) + counts.get("TP3_HIT", 0)
+        wins = counts.get("TP3_HIT", 0)
         losses = counts.get("SL_HIT", 0)
         breakeven = counts.get("BREAKEVEN_HIT", 0)
-        open_count = counts.get("OPEN", 0)
+        excluded_from_open = ("TP3_HIT", "SL_HIT", "BREAKEVEN_HIT", "WAITING_ENTRY", "ENTRY_INVALIDATED")
+        waiting = counts.get("WAITING_ENTRY", 0)
+        invalidated = counts.get("ENTRY_INVALIDATED", 0)
+        # انتظار ورود جدا از معاملات فعال است؛ NULL هم در SQL انتخاب نمی‌شود.
+        open_count = sum(
+            count for status, count in counts.items()
+            if status is not None and status not in excluded_from_open
+        )
         closed = wins + losses  # سربه‌سر نه برده حساب می‌شه نه باخته، پس توی نرخ برد نمیاد
+        resolved = closed + breakeven
+        target_progress = {
+            status: counts.get(status, 0)
+            for status in ("TP1_HIT", "TP2_HIT", "TP3_HIT")
+        }
         win_rate = (wins / closed * 100) if closed > 0 else None
         return {
             "wins": wins, "losses": losses, "breakeven": breakeven, "open": open_count,
             "closed": closed, "win_rate": win_rate, "breakdown": counts,
+            # closed برای سازگاری، همان تعداد برد+باخت است؛ resolved همه‌ی نهایی‌هاست.
+            "decided": closed, "resolved": resolved, "target_progress": target_progress,
+            "waiting": waiting, "invalidated": invalidated, "monitored": open_count + waiting,
         }
 
 
 async def get_user_open_signals(user_id: int) -> list[dict]:
-    """لیست سیگنال‌های فعال (باز یا TP1/TP2 خورده) این کاربر - برای /mysignals"""
+    """سیگنال‌های در پایش: انتظار ورود یا فعال؛ برای /mysignals."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            """SELECT id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, status, created_at
+            """SELECT id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, status, created_at,
+                      entry_triggered_at, entry_observed_price
                FROM signal_performance
-               WHERE user_id = ? AND status NOT IN ('TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT')
+               WHERE user_id = ? AND status NOT IN ('TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT', 'ENTRY_INVALIDATED')
                ORDER BY id DESC""",
             (user_id,)
         )
         rows = await cursor.fetchall()
-        cols = ["id", "symbol", "timeframe", "direction", "entry", "sl", "tp1", "tp2", "tp3", "status", "created_at"]
+        cols = ["id", "symbol", "timeframe", "direction", "entry", "sl", "tp1", "tp2", "tp3", "status", "created_at",
+                "entry_triggered_at", "entry_observed_price"]
         return [dict(zip(cols, r)) for r in rows]
 
 
@@ -455,13 +789,12 @@ async def create_pending_signal(user_id: int, symbol: str, timeframe: str, direc
     tp2 = tps[1] if len(tps) > 1 else None
     tp3 = tps[2] if len(tps) > 2 else None
     async with aiosqlite.connect(DB_PATH) as db:
-        # پاکسازی سبک: pending‌های قدیمی همین کاربر (بیش از ۲۴ ساعت، یعنی
-        # جواب نداده) رو حذف کن تا جدول بی‌دلیل بزرگ نشه. مقایسه رو با
-        # timestamp پایتونی انجام می‌دیم (نه توابع تاریخ SQLite) چون
-        # فرمت isoformat پایتون با فرمت پیش‌فرض datetime() در SQLite یکی نیست.
+        # پاکسازی سبک، نه مرجع اعتبار تایید. datetime هر دو طرف را به UTC
+        # نرمال می‌کند؛ مقایسه‌ی سخت‌گیرانه ممکن است حذف را کمتر از یک ثانیه
+        # عقب بیندازد، اما انقضای دقیق هنگام تصمیم بررسی می‌شود.
         cutoff = (datetime.utcnow() - timedelta(days=1)).isoformat()
         await db.execute(
-            "DELETE FROM pending_signals WHERE user_id = ? AND created_at < ?",
+            "DELETE FROM pending_signals WHERE user_id = ? AND datetime(created_at) < datetime(?)",
             (user_id, cutoff)
         )
         cursor = await db.execute(
@@ -475,20 +808,89 @@ async def create_pending_signal(user_id: int, symbol: str, timeframe: str, direc
 
 
 async def get_pending_signal(pending_id: int) -> dict | None:
+    """خواندن خام برای مشاهده؛ وجود ردیف به معنی اعتبار یا قابل‌تایید بودن نیست."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            """SELECT id, user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3
+            """SELECT id, user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, created_at
                FROM pending_signals WHERE id = ?""",
             (pending_id,)
         )
         row = await cursor.fetchone()
         if not row:
             return None
-        cols = ["id", "user_id", "symbol", "timeframe", "direction", "entry", "sl", "tp1", "tp2", "tp3"]
+        cols = ["id", "user_id", "symbol", "timeframe", "direction", "entry", "sl", "tp1", "tp2", "tp3", "created_at"]
         return dict(zip(cols, row))
 
 
+def _pending_time_outcome(created_at, now: datetime) -> str | None:
+    """زمان‌های قدیمی بدون offset، UTC هستند؛ زمان نامعلوم/آینده پذیرفته نمی‌شود."""
+    try:
+        created = datetime.fromisoformat(created_at)
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        created = created.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return "invalid_timestamp"
+    if created > now:
+        return "invalid_timestamp"
+    return "expired" if now - created >= timedelta(hours=24) else None
+
+
+async def decide_pending_signal(pending_id: int, user_id: int, confirm: bool) -> dict:
+    """
+    تصمیم اتمیک درباره‌ی یک pending: یک تصمیم برنده، حداکثر یک ثبت پایش.
+    BEGIN IMMEDIATE قبل از خواندن، تایید/رد هم‌زمان را سری می‌کند.
+    وضعیت‌های missing/forbidden/invalid داده را تغییر نمی‌دهند؛ مالک می‌تواند
+    درخواست expired/invalid_timestamp را مصرف کند، اما معامله ثبت نمی‌شود.
+    """
+    async with aiosqlite.connect(DB_PATH) as connection:
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                "SELECT * FROM pending_signals WHERE id = ?", (pending_id,)
+            )
+            pending = await cursor.fetchone()
+            if pending is None:
+                await connection.rollback()
+                return {"outcome": "missing"}
+            if pending["user_id"] != user_id:
+                await connection.rollback()
+                return {"outcome": "forbidden"}
+
+            # ساعت را بعد از انتظار برای قفل می‌خوانیم، نه قبل از تراکنش.
+            outcome = _pending_time_outcome(pending["created_at"], datetime.now(timezone.utc))
+            perf_id = None
+            if outcome is None and confirm:
+                try:
+                    perf_id = await _insert_signal_performance(
+                        connection, pending["user_id"], pending["symbol"],
+                        pending["timeframe"], pending["direction"],
+                        pending["entry"], pending["sl"],
+                        [pending["tp1"], pending["tp2"], pending["tp3"]]
+                    )
+                except ValueError:
+                    await connection.rollback()
+                    return {"outcome": "invalid"}
+                outcome = "accepted"
+            elif outcome is None:
+                outcome = "declined"
+
+            cursor = await connection.execute(
+                "DELETE FROM pending_signals WHERE id = ? AND user_id = ?",
+                (pending_id, user_id)
+            )
+            if cursor.rowcount != 1:
+                raise aiosqlite.IntegrityError("Pending decision was not consumed")
+            await connection.commit()
+            return {"outcome": outcome, "performance_id": perf_id}
+        except BaseException:
+            await connection.rollback()
+            raise
+
+
 async def delete_pending_signal(pending_id: int):
+    """حذف خام؛ برای تصمیم کاربر از decide_pending_signal استفاده شود."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM pending_signals WHERE id = ?", (pending_id,))
         await db.commit()
@@ -674,13 +1076,13 @@ async def get_access_requests() -> list[dict]:
 
 async def get_resolved_signals(user_id: int = None) -> list[dict]:
     """
-    همه‌ی سیگنال‌هایی که به یه نتیجه‌ی نهایی (TP/SL/سربه‌سر) رسیدن - پایه‌ی
+    همه‌ی سیگنال‌هایی که به یه نتیجه‌ی نهایی (TP3/SL/سربه‌سر) رسیدن - پایه‌ی
     تحلیل فراداده (کدوم تایم‌فریم/نماد/روز بهتر عمل کرده). اگه user_id
     داده بشه فقط سیگنال‌های همون کاربر، وگرنه کل ربات (برای ادمین).
     """
     query = """SELECT symbol, timeframe, direction, status, created_at, closed_at
                FROM signal_performance
-               WHERE status IN ('TP1_HIT', 'TP2_HIT', 'TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT')"""
+               WHERE status IN ('TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT')"""
     params = ()
     if user_id is not None:
         query += " AND user_id = ?"
@@ -702,7 +1104,7 @@ async def get_resolved_signals_for(symbol: str, timeframe: str, direction: str) 
         cursor = await db.execute(
             """SELECT status FROM signal_performance
                WHERE symbol = ? AND timeframe = ? AND direction = ?
-               AND status IN ('TP1_HIT', 'TP2_HIT', 'TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT')""",
+               AND status IN ('TP3_HIT', 'SL_HIT', 'BREAKEVEN_HIT')""",
             (symbol, timeframe, direction)
         )
         rows = await cursor.fetchall()

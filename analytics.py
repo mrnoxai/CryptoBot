@@ -5,8 +5,8 @@
 /signal گرفته شدن و به نتیجه رسیدن (TP/SL/سربه‌سر)، الگو استخراج
 می‌کنه: کدوم تایم‌فریم بهتر جواب داده، کدوم نماد، کدوم روز هفته.
 
-منطق برد/باخت دقیقاً هماهنگ با /mystats هست: TP1/TP2/TP3 برد، SL باخت،
-سربه‌سر نه برد حساب می‌شه نه باخت (فقط جدا نمایش داده می‌شه).
+منطق برد/باخت هماهنگ با /mystats هست: فقط TP3 نهایی برد و SL باخت است.
+TP1/TP2 پیشرفتِ هنوز باز هستند؛ سربه‌سر جدا نمایش داده می‌شه و در نرخ برد نمیاد.
 
 ---------- فاز ۲ تقویت موتور سیگنال: یادگیری از تاریخچه‌ی عملکرد سیگنال‌ها ----------
 علاوه بر تحلیل‌های نمایشی بالا، get_historical_performance برای موتور سیگنال اضافه شد
@@ -22,20 +22,25 @@ MIN_SAMPLES_FOR_CONFIDENCE = 5  # کمتر از این تعداد، نتیجه�
 WEEKDAY_FA = ["دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه", "یکشنبه"]
 
 
-def _classify(status: str) -> str:
+def _classify(status: str) -> str | None:
+    if status == "TP3_HIT":
+        return "win"
     if status == "SL_HIT":
         return "loss"
     if status == "BREAKEVEN_HIT":
         return "breakeven"
-    return "win"  # TP1_HIT / TP2_HIT / TP3_HIT
+    return None  # OPEN، اهداف میانی و وضعیت نامعتبر نتیجه‌ی نهایی نیستند.
 
 
 def _group_stats(rows: list, key_func) -> list[dict]:
     """گروه‌بندی سیگنال‌های به‌نتیجه‌رسیده بر اساس یه کلید دلخواه (تایم‌فریم، نماد، روز هفته، ...)"""
     groups = defaultdict(lambda: {"win": 0, "loss": 0, "breakeven": 0})
     for row in rows:
+        outcome = _classify(row["status"])
+        if outcome is None:
+            continue
         key = key_func(row)
-        groups[key][_classify(row["status"])] += 1
+        groups[key][outcome] += 1
 
     result = []
     for key, counts in groups.items():
@@ -99,7 +104,9 @@ async def get_historical_performance(symbol: str, timeframe: str, direction: str
     rows = await db.get_resolved_signals_for(symbol, timeframe, direction)
     counts = {"win": 0, "loss": 0, "breakeven": 0}
     for row in rows:
-        counts[_classify(row["status"])] += 1
+        outcome = _classify(row["status"])
+        if outcome is not None:
+            counts[outcome] += 1
 
     decided = counts["win"] + counts["loss"]
     if decided < MIN_SAMPLES_FOR_CONFIDENCE:

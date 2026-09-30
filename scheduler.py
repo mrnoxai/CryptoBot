@@ -5,6 +5,7 @@
 کاربرانی که اون نماد رو واچ کردن و autoscan فعاله پیام می‌فرسته.
 """
 import logging
+import aiosqlite
 from collections import defaultdict
 from telegram.ext import Application
 from telegram.constants import ParseMode
@@ -16,9 +17,31 @@ import backup
 logger = logging.getLogger(__name__)
 
 
+async def _background_recipients(user_ids, kind: str) -> set[int]:
+    """انتخاب اولیه؛ خطای خواندن سیاست، مجوز ارسال ایجاد نمی‌کند."""
+    try:
+        return await db.get_background_notification_recipients(user_ids, kind)
+    except aiosqlite.Error:
+        logger.exception("خواندن سیاست گیرندگان %s ناموفق بود؛ ارسال متوقف شد.", kind)
+        return set()
+
+
+async def _can_send_background(user_id: int, kind: str, symbol: str | None = None) -> bool:
+    """بدون کش و درست پیش از send؛ خطای سیاست = عدم ارسال."""
+    try:
+        return await db.can_receive_background_notification(user_id, kind, symbol)
+    except aiosqlite.Error:
+        logger.exception("خواندن دسترسی اعلان %s برای %s ناموفق بود؛ پیام ارسال نمی‌شود.", kind, user_id)
+        return False
+
+
 async def scan_job(app: Application):
     logger.info("شروع اسکن خودکار واچ‌لیست‌ها...")
     pairs = await db.get_all_active_watch_pairs()  # [(user_id, symbol), ...]
+    if not pairs:
+        return
+    allowed = await _background_recipients([uid for uid, _ in pairs], "scan")
+    pairs = [(uid, symbol) for uid, symbol in pairs if uid in allowed]
     if not pairs:
         return
 
@@ -56,6 +79,8 @@ async def scan_job(app: Application):
                 f"⚠️ توصیه مالی نیست."
             )
             for user_id in user_ids:
+                if not await _can_send_background(user_id, "scan", symbol):
+                    continue
                 try:
                     await app.bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.MARKDOWN)
                 except Exception as e:
@@ -73,16 +98,32 @@ async def check_signal_performance_job(app: Application):
     TP3، SL و BREAKEVEN نهایی‌ان (سیگنال می‌بنده)؛ TP1/TP2 سیگنال رو
     باز نگه می‌دارن چون ممکنه به سطح بعدی هم برسه.
 
-    بعد از رسیدن به TP1 (اولین‌بار)، اگه BREAKEVEN_AFTER_TP1 فعال باشه،
-    حد ضرر خودکار به نقطه‌ی ورود (سربه‌سر) منتقل می‌شه - یعنی از اون
-    لحظه به بعد، این معامله دیگه نمی‌تونه ضرر واقعی بده؛ اگه بعداً به
+    بعد از رسیدن به TP1 یا عبور مستقیم به TP2، اگه BREAKEVEN_AFTER_TP1
+    فعال باشه و SL هنوز سربه‌سر نشده باشه، حد ضرر ثبت‌شده در پایش به
+    نقطه‌ی ورود منتقل می‌شه (نه سفارش واقعی صرافی)؛ اگه بعداً به
     همون SL جدید (=entry) برخورد کنه، به‌جای SL_HIT، BREAKEVEN_HIT ثبت
     می‌شه (نه برد نه باخت).
+
+    ثبت‌های جدید تا مشاهده‌ی محدوده‌ی ورود WAITING_ENTRY می‌مانند؛
+    لمس SL پیش از ورود، ابطال مدل است نه باخت. قیمت ticker صرفاً یک
+    مشاهده است و لمس‌های بین دو نوبت پایش یا اجرای سفارش را اثبات نمی‌کند.
+
+    گذار فعال بر اساس رکورد تازه در تراکنش است؛ status/SL/closed_at با
+    هم ثبت می‌شوند. خطای SQLite در یک گذار فعال، بقیه را متوقف نمی‌کند.
+    اعلان بعد از commit است و تحویل یا ارسال مجدد آن تضمین نمی‌شود.
+    محدودیت دسترسی، اعلان را می‌بندد نه پیشرفت سوابق پایش را؛ دسترسی
+    بعد از ثبت گذار و درست پیش از ارسال دوباره بررسی می‌شود.
+    هر نوبت فقط یک دسته‌ی چرخشی رزرو می‌شود؛ نشانگر پیش از شبکه ثبت
+    می‌شود و موفقیت دریافت قیمت را اثبات نمی‌کند. سقف چرخه ثابت است.
     """
     from config import MAX_OPEN_SIGNALS_PER_CHECK, BREAKEVEN_AFTER_TP1
 
     logger.info("شروع پایش عملکرد سیگنال‌های باز...")
-    open_signals = await db.get_open_signal_performances(limit=MAX_OPEN_SIGNALS_PER_CHECK)
+    try:
+        open_signals = await db.claim_signal_performance_batch(limit=MAX_OPEN_SIGNALS_PER_CHECK)
+    except (aiosqlite.Error, ValueError):
+        logger.exception("انتخاب دسته‌ی پایش ناموفق بود؛ این نوبت بدون دریافت قیمت متوقف می‌شود.")
+        return
     if not open_signals:
         return
 
@@ -98,56 +139,57 @@ async def check_signal_performance_job(app: Application):
     finally:
         await client.close()
 
-    status_order = {"OPEN": 0, "TP1_HIT": 1, "TP2_HIT": 2, "TP3_HIT": 3}
-
     for sig in open_signals:
         price = prices.get(sig["symbol"])
-        if price is None:
+        if not db.is_valid_price(price):
             continue
 
-        is_breakeven_sl = sig["sl"] is not None and abs(sig["sl"] - sig["entry"]) < 1e-9
+        if sig["status"] == "WAITING_ENTRY":
+            if await db.invalidate_waiting_entry(sig["id"], price):
+                entry_note = (
+                    "سیگنال پیش از ورود فرضی باطل شد؛ قیمت مشاهده‌شده به SL رسیده یا از آن عبور کرده است.\n"
+                    "این وضعیت برد یا باخت معامله نیست؛ مسیر قیمت بین دو مشاهده معلوم نیست."
+                )
+            elif await db.activate_signal_entry(sig["id"], price):
+                entry_note = (
+                    "ورود فرضی در مدل پایش فعال شد؛ این پیام تأیید اجرای سفارش واقعی نیست.\n"
+                    "Entry برنامه‌ریزی‌شده تغییر نکرده و قیمت مشاهده‌شده جدا ثبت شده است."
+                )
+            else:
+                continue
+            if not await _can_send_background(sig["user_id"], "performance"):
+                continue
+            try:
+                await app.bot.send_message(
+                    chat_id=sig["user_id"],
+                    text=(
+                        f"📌 *پایش سیگنال {sig['symbol']}* ({sig['timeframe']})\n"
+                        f"{entry_note}\n"
+                        f"قیمت مشاهده‌شده: `{price:,.4f}`\n"
+                        f"Entry برنامه‌ریزی‌شده: `{sig['entry']:,.4f}`\n\n"
+                        "برای مشاهده وضعیت: /mysignals و /mystats"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.warning(f"ارسال وضعیت ورود به {sig['user_id']} ناموفق بود: {e}")
+            continue  # TP/SL فقط در مشاهده‌های بعد از فعال‌سازی پایش می‌شوند.
 
-        candidate_status = None
-        if sig["direction"] == "BUY":
-            if sig["sl"] and price <= sig["sl"]:
-                candidate_status = "BREAKEVEN_HIT" if is_breakeven_sl else "SL_HIT"
-            elif sig["tp3"] and price >= sig["tp3"]:
-                candidate_status = "TP3_HIT"
-            elif sig["tp2"] and price >= sig["tp2"]:
-                candidate_status = "TP2_HIT"
-            elif sig["tp1"] and price >= sig["tp1"]:
-                candidate_status = "TP1_HIT"
-        elif sig["direction"] == "SELL":
-            if sig["sl"] and price >= sig["sl"]:
-                candidate_status = "BREAKEVEN_HIT" if is_breakeven_sl else "SL_HIT"
-            elif sig["tp3"] and price <= sig["tp3"]:
-                candidate_status = "TP3_HIT"
-            elif sig["tp2"] and price <= sig["tp2"]:
-                candidate_status = "TP2_HIT"
-            elif sig["tp1"] and price <= sig["tp1"]:
-                candidate_status = "TP1_HIT"
-
-        if not candidate_status or candidate_status == sig["status"]:
-            continue  # هیچ پیشرفت جدیدی نسبت به آخرین باری که چک شده نیست
-
-        # SL/BREAKEVEN همیشه یعنی وضعیت تغییر کرده (مگر از قبل همون بوده که بالا رد شد)
-        is_progress = (
-            candidate_status in ("SL_HIT", "BREAKEVEN_HIT")
-            or status_order.get(candidate_status, 0) > status_order.get(sig["status"], 0)
-        )
-        if not is_progress:
+        try:
+            committed = await db.advance_signal_performance(
+                sig["id"], price, BREAKEVEN_AFTER_TP1
+            )
+        except aiosqlite.Error:
+            logger.exception("ثبت گذار پایش سیگنال %s ناموفق بود؛ سایر سیگنال‌ها ادامه دارند.", sig["id"])
             continue
-
-        should_close = candidate_status in ("TP3_HIT", "SL_HIT", "BREAKEVEN_HIT")
-        if should_close:
-            await db.close_signal_performance(sig["id"], candidate_status)
-        else:
-            await db.update_signal_status(sig["id"], candidate_status)
+        if committed is None:
+            continue
+        sig = committed
+        candidate_status = sig["status"]
 
         breakeven_note = ""
-        if candidate_status == "TP1_HIT" and BREAKEVEN_AFTER_TP1:
-            await db.move_sl_to_breakeven(sig["id"], sig["entry"])
-            breakeven_note = "\n\n🛡 حد ضرر خودکار به نقطه‌ی سربه‌سر (Break-even) منتقل شد - از الان این معامله دیگه نمی‌تونه ضرر واقعی بده."
+        if sig["breakeven_changed"]:
+            breakeven_note = "\n\n🛡 حد ضرر ثبت‌شده در پایش به نقطه‌ی سربه‌سر (Break-even) منتقل شد؛ این تغییر، سفارش واقعی صرافی را تغییر نمی‌دهد."
 
         emoji = {"TP1_HIT": "🎯", "TP2_HIT": "🎯", "TP3_HIT": "🎯",
                  "SL_HIT": "🛑", "BREAKEVEN_HIT": "🛡"}[candidate_status]
@@ -155,8 +197,10 @@ async def check_signal_performance_job(app: Application):
             "TP1_HIT": "به TP1 رسید", "TP2_HIT": "به TP2 رسید",
             "TP3_HIT": "به TP3 رسید (سیگنال بسته شد ✅)",
             "SL_HIT": "به حد ضرر خورد (سیگنال بسته شد ❌)",
-            "BREAKEVEN_HIT": "بعد از رسیدن به TP1، به نقطه‌ی سربه‌سر برگشت (سیگنال بدون سود/ضرر بسته شد ⚪️)",
+            "BREAKEVEN_HIT": "به حد ضرر سربه‌سرِ مدل پایش برگشت (بسته شد ⚪️؛ کارمزد/لغزش محاسبه نشده)",
         }[candidate_status]
+        if not await _can_send_background(sig["user_id"], "performance"):
+            continue
         try:
             await app.bot.send_message(
                 chat_id=sig["user_id"],
@@ -180,19 +224,22 @@ async def news_auto_job(app: Application):
     """اگه خبر خیلی مهم (تاثیر >=80%) اومده، برای کاربرانی که ارسال خودکار رو روشن کردن می‌فرسته"""
     try:
         import news as news_module
-        import database as db2
+        user_ids = await db.get_users_with_news_auto()
+        allowed = await _background_recipients(user_ids, "news")
+        user_ids = [uid for uid in user_ids if uid in allowed]
+        if not user_ids:
+            return
         items = await news_module.get_combined_news(crypto_limit=6, forex_limit=4)
         hot = [n for n in items if n["impact"] >= 80]
         if not hot:
             return
-        # برای جلوگیری از اسپم تکراری، فقط اگه خبر جدید باشه (کش اخبار هر 15 دقیقه عوض می‌شه)
-        user_ids = await db2.get_users_with_news_auto()
-        if not user_ids:
-            return
+        # کش خبر به‌تنهایی مانع ارسال تکراری نیست؛ dedup مرحله‌ی جداگانه است.
         text = news_module.format_news_message(hot[:3], max_items=3)
         header = "🚨 *خبر فوری بازار (تاثیر خیلی بالا)*\n\n"
         full = header + text
         for uid in user_ids:
+            if not await _can_send_background(uid, "news"):
+                continue
             try:
                 await app.bot.send_message(chat_id=uid, text=full, parse_mode="Markdown", disable_web_page_preview=True)
             except Exception as e:
@@ -216,6 +263,8 @@ async def backup_job(app: Application):
     except Exception as e:
         logger.error(f"بکاپ خودکار دوره‌ای ناموفق بود: {e}")
         for admin_id in ADMIN_IDS:
+            if not await _can_send_background(admin_id, "backup"):
+                continue
             try:
                 await app.bot.send_message(
                     chat_id=admin_id,
