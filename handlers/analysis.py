@@ -366,7 +366,10 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
             risk_settings = await db.get_user_risk(user_id)
             position_size = _calc_position_size(risk_settings, result.entry, result.sl, result.volatility_risk_mult)
 
-        await db.log_signal(symbol, result.direction, result.context_adjusted_confidence_percent, result.price)
+        await db.log_signal(
+            symbol, result.direction, result.context_adjusted_confidence_percent, result.price,
+            source=db.SIGNAL_SOURCE_SINGLE_TIMEFRAME,
+        )
 
         # به‌جای ثبت خودکار برای پایش، فقط یه رکورد موقت می‌سازیم و از
         # کاربر با دکمه می‌پرسیم که واقعاً می‌خواد پیگیریش کنه یا نه
