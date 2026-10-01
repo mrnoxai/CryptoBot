@@ -156,7 +156,7 @@ async def _handle_track_decision(query, pending_id: int, confirm: bool):
         "invalid_timestamp": "زمان ثبت این درخواست معتبر نیست؛ دوباره سیگنال بگیر.",
         "missing": "این درخواست دیگر موجود نیست؛ ممکن است قبلاً رسیدگی یا حذف شده باشد.",
         "forbidden": "این دکمه مال تو نیست.",
-        "invalid": "قیمت ورود یا حد ضرر این سیگنال معتبر نیست؛ دوباره تحلیل بگیر.",
+        "invalid": "قیمت ورود، حد ضرر یا ترتیب تارگت‌های این سیگنال معتبر نیست؛ دوباره تحلیل بگیر.",
     }
     await query.answer(messages[outcome], show_alert=True)
     if outcome not in ("accepted", "declined", "expired", "invalid_timestamp"):

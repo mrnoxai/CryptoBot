@@ -21,6 +21,27 @@ EXIT_REASON_FA = {
     "TIMEOUT": "بدون رسیدن به هیچ سطحی، دوره تموم شد",
     "STILL_OPEN": "هنوز باز (داده تموم شد) — توی آمار حساب نشده",
 }
+ENTRY_SKIP_REASON_FA = {
+    "INVALID_ENTRY_PRICE": "قیمت ورود نامعتبر",
+    "ENTRY_AT_OR_BEYOND_SL": "ورود روی یا آن‌سوی SL",
+    "ENTRY_AT_OR_BEYOND_TP1": "ورود روی یا آن‌سوی TP1",
+    "INVALID_ACTUAL_GEOMETRY": "هندسه/نسبت R ورود نامعتبر",
+    "INVALID_SIGNAL_LEVELS": "خروجی سیگنال نامعتبر",
+}
+
+
+def _format_skipped_reasons(reason_counts: dict) -> str:
+    return "؛ ".join(f"{ENTRY_SKIP_REASON_FA.get(reason, 'علت دیگر')}: {number}"
+                     for reason, number in reason_counts.items())
+
+
+def _format_skipped_entries(skipped_count: int, reason_counts: dict) -> list:
+    if not skipped_count:
+        return []
+    return [
+        f"⏭ ورودی‌های ردشده: *{skipped_count}* — در برد، باخت و R حساب نشده‌اند.",
+        _format_skipped_reasons(reason_counts),
+    ]
 
 
 def _fmt_price(value) -> str:
@@ -46,9 +67,10 @@ def _format_backtest_result(result, title_prefix: str = "📊") -> str:
         f"بازه: {date_from} تا {date_to} ({result.candles_tested} کندل)",
         "",
     ]
+    lines += _format_skipped_entries(result.skipped_count, result.skipped_reason_counts)
 
     if result.total_trades == 0:
-        lines.append("توی این بازه هیچ سیگنال قطعی‌ای (BUY/SELL) صادر نشد — یعنی بازار توی این محدوده اکثراً رنج/خنثی بوده یا اندیکاتورها هم‌جهت نشدن.")
+        lines.append("در این بازه هیچ معاملهٔ نهایی‌شده‌ای برای آمار وجود ندارد.")
         if result.still_open_count:
             lines.append(f"\n({result.still_open_count} معامله هنوز باز مونده بود چون داده تموم شد - توی آمار حساب نشده)")
         return "\n".join(lines)
@@ -71,10 +93,10 @@ def _format_backtest_result(result, title_prefix: str = "📊") -> str:
 
 def _format_full_backtest_message(result) -> str:
     text = _format_backtest_result(result)
-    if result.total_trades == 0:
-        return text
 
-    lines = [text, "", "📋 چند معامله‌ی آخر:"]
+    lines = [text]
+    if result.trades:
+        lines += ["", "📋 چند معامله‌ی آخر:"]
     for t in result.trades[-5:]:
         reason_fa = EXIT_REASON_FA.get(t.exit_reason, t.exit_reason)
         dir_emoji = "🟢" if t.direction == "BUY" else "🔴"
@@ -84,7 +106,9 @@ def _format_full_backtest_message(result) -> str:
         "",
         "⚠️ *روش‌شناسی*: ورود فرضی با قیمت باز شدن کندل بعد از سیگنال؛ اگه "
         "توی یه کندل هم SL و هم TP لمس بشن، محافظه‌کارانه فرض می‌کنیم SL "
-        "اول خورده. این یه شبیه‌سازی روی داده‌ی گذشته‌ست، نه تضمین عملکرد آینده.",
+        "اول خورده. ورود روی یا آن‌سوی SL یا TP1 رد می‌شود؛ SL/تارگت‌ها "
+        "برای سازگار کردن گپ جابه‌جا نمی‌شوند. آمار فقط ورودی‌های معتبر است "
+        "و کارمزد/لغزش هنوز لحاظ نشده. این شبیه‌سازی تضمین عملکرد آینده نیست.",
     ]
     return "\n".join(lines)
 
@@ -98,11 +122,13 @@ def _format_walk_forward_message(results: list, symbol: str, timeframe: str) -> 
     ]
 
     all_trades = []
+    skipped_count = 0
+    skipped_reasons = {}
     for i, r in enumerate(results, 1):
         date_from = str(r.date_from)[:10] if r.date_from is not None else "-"
         date_to = str(r.date_to)[:10] if r.date_to is not None else "-"
         if r.total_trades == 0:
-            lines.append(f"*بازه {i}* ({date_from} تا {date_to}): بدون سیگنال قطعی")
+            lines.append(f"*بازه {i}* ({date_from} تا {date_to}): بدون معاملهٔ نهایی")
         else:
             wr = f"{r.win_rate:.0f}%" if r.win_rate is not None else "-"
             lines.append(
@@ -110,12 +136,20 @@ def _format_walk_forward_message(results: list, symbol: str, timeframe: str) -> 
                 f"برد {wr} | مجموع R: {r.total_r:+.2f}"
             )
         all_trades.extend(r.trades)
+        if r.skipped_count:
+            lines.append(f"⏭ ورودی ردشده در این بازه: {r.skipped_count}")
+        if r.still_open_count:
+            lines.append(f"معاملهٔ هنوز باز در این بازه: {r.still_open_count}")
+        skipped_count += r.skipped_count
+        for reason, number in r.skipped_reason_counts.items():
+            skipped_reasons[reason] = skipped_reasons.get(reason, 0) + number
 
     resolved = [t for t in all_trades if t.exit_reason != "STILL_OPEN"]
     total = len(resolved)
     lines += ["", "📐 *جمع کل (همه‌ی بازه‌ها):*"]
+    lines += _format_skipped_entries(skipped_count, skipped_reasons)
     if total == 0:
-        lines.append("هیچ معامله‌ای توی کل بازه‌ها شکل نگرفت.")
+        lines.append("هیچ معاملهٔ نهایی‌شده‌ای در کل بازه‌ها وجود ندارد.")
     else:
         wins = sum(1 for t in resolved if t.r_multiple > 0)
         total_r = sum(t.r_multiple for t in resolved)
@@ -135,7 +169,9 @@ def _format_walk_forward_message(results: list, symbol: str, timeframe: str) -> 
         "اندیکاتورهاش معتبر باشن؛ بازه‌ی اول این امکان رو نداره، پس ممکنه "
         "عملکردش کمی محافظه‌کارانه‌تر به‌نظر برسه. تعداد معاملات هر بازه "
         "کمتر از یه بک‌تست کامله (چون داده بین چند بخش تقسیم شده) - برای "
-        "نتیجه‌ی آماری قابل‌اتکاتر، بازه‌ی زمانی بیشتری امتحان کن.",
+        "نتیجه‌ی آماری قابل‌اتکاتر، بازه‌ی زمانی بیشتری امتحان کن. ورودی "
+        "روی یا آن‌سوی SL/TP1 رد می‌شود؛ آمار فقط ورودی معتبر است و "
+        "کارمزد/لغزش هنوز لحاظ نشده.",
     ]
     return "\n".join(lines)
 
@@ -279,6 +315,15 @@ def _format_calibration_message(candidates: list, symbols: list, timeframe: str)
             "از رتبه‌بندی حذف شدن؛ آماری قابل‌اتکا ندارن."
         )
 
+    skipped_candidates = [candidate for candidate in candidates if candidate.skipped_count]
+    if skipped_candidates:
+        lines.append("\n⏭ ورودی‌های ردشده به تفکیک ترکیب (این شمارش‌ها رویداد یکتا نیستند):")
+        for candidate in skipped_candidates:
+            lines.append(
+                f"{candidate.confidence_threshold_fraction:.2f}/{candidate.atr_sl_mult:.1f}: "
+                f"{candidate.skipped_count} — {_format_skipped_reasons(candidate.skipped_reason_counts)}"
+            )
+
     lines.append("")
     lines.append(
         "📐 *امتیاز ترکیبی* = میانگین R − (اختلاف نرخ برد بین بازه‌ها ÷ ۱۰۰) × " +
@@ -289,7 +334,9 @@ def _format_calibration_message(candidates: list, symbols: list, timeframe: str)
     lines.append("")
     lines.append(
         "⚠️ این فقط یه *گزارشه* — هیچ تنظیمی خودکار اعمال نمی‌شه. "
-        "برای اعمال یکی از ترکیب‌های بالا، روی دکمه‌ش بزن."
+        "برای اعمال یکی از ترکیب‌های بالا، روی دکمه‌ش بزن. ردشدگی ورودی‌ها "
+        "در امتیاز جریمهٔ جداگانه ندارد؛ آمار فقط معاملات معتبر است و "
+        "کارمزد/لغزش هنوز لحاظ نشده."
     )
     return "\n".join(lines)
 

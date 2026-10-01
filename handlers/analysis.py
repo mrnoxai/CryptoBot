@@ -270,7 +270,14 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
     اگه نماد معتبر بود ولی داده‌ی تاریخی کافی نداشت (مثلاً یه کوین تازه
     روی تایم‌فریم هفتگی): (متن هشدار, None, None) - یعنی chart_buf رو
     نساز و نفرست، چون بر پایه‌ی اندیکاتورهای ناقص گمراه‌کننده می‌شه
+    خروجی/تارگت نامعتبر نیز فقط هشدار می‌دهد؛ تاریخچه و pending ثبت نمی‌شود.
     """
+    from trade_validation import TradeGeometryError, validate_signal_output
+    invalid_output_message = (
+        "⚠️ خروجی سیگنال یا تنظیمات تارگت معتبر نیست.\n"
+        "قیمت‌ها باید مثبت و متناهی و ترتیب Entry، SL و سه تارگت صحیح باشد.\n"
+        "سیگنال قابل‌پیگیری صادر نشد و برای پایش ثبت نشده است؛ داده و تنظیمات را بررسی کن."
+    )
     client = ExchangeClient()
     try:
         if not await client.validate_symbol(symbol):
@@ -294,17 +301,21 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
         atr_sl_mult = await db.get_float_setting("atr_sl_mult", 1.5)
         rr_targets_raw = await db.get_setting("rr_targets")
         rr_targets = None
-        if rr_targets_raw:
+        if rr_targets_raw is not None:
             try:
                 rr_targets = [float(x.strip()) for x in rr_targets_raw.split(",")]
             except ValueError:
-                rr_targets = None
+                return invalid_output_message, None, None
 
-        result = build_single_result(
-            df, symbol, timeframe,
-            confidence_threshold_fraction=confidence_threshold,
-            atr_sl_mult=atr_sl_mult, rr_targets=rr_targets
-        )
+        try:
+            result = build_single_result(
+                df, symbol, timeframe,
+                confidence_threshold_fraction=confidence_threshold,
+                atr_sl_mult=atr_sl_mult, rr_targets=rr_targets
+            )
+            validate_signal_output(result.direction, result.price, result.entry, result.sl, result.tps)
+        except TradeGeometryError:
+            return invalid_output_message, None, None
 
         try:
             ticker = await client.exchange.fetch_ticker(symbol)
@@ -346,6 +357,10 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
                 result, higher_tf_info, btc_corr_info, order_book_info, historical_performance_info,
                 second_higher_tf_info=second_higher_tf_info,
             )
+            try:
+                validate_signal_output(result.direction, result.price, result.entry, result.sl, result.tps)
+            except TradeGeometryError:
+                return invalid_output_message, None, None
 
         # فاندامنتال (منابع رایگان، best-effort - اگه در دسترس نبود، فقط حذف می‌شه از پیام)
         coin_fundamentals = None
