@@ -6,15 +6,22 @@ import aiosqlite
 import json
 import logging
 import math
+import uuid
 from datetime import datetime, timedelta, timezone
 from config import DB_PATH
 
 logger = logging.getLogger(__name__)
 MONITOR_QUEUE_STATE_KEY = "_signal_performance_queue"
+SIGNAL_SOURCE_SINGLE_TIMEFRAME = "single_timeframe"
+SIGNAL_SOURCE_MULTI_TIMEFRAME = "multi_timeframe"
+SIGNAL_HISTORY_SOURCES = (
+    SIGNAL_SOURCE_SINGLE_TIMEFRAME, SIGNAL_SOURCE_MULTI_TIMEFRAME
+)
+NEWS_DELIVERY_LEASE_SECONDS = 10 * 60
 
 
 async def init_db():
-    """ساخت جداول و مهاجرت افزایشی ستون‌های پایش، بدون بازنویسی رکوردها."""
+    """ساخت جداول و مهاجرت افزایشی پایش/تاریخچه، بدون بازنویسی رکوردها."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -40,8 +47,18 @@ async def init_db():
                 signal_type TEXT,
                 score INTEGER,
                 price REAL,
-                created_at TEXT
+                created_at TEXT,
+                source TEXT
             )
+        """)
+        # منبع سوابق قدیمی معلوم نیست؛ NULL می‌ماند و به‌حدس برچسب نمی‌خورد.
+        cursor = await db.execute("PRAGMA table_info(signal_history)")
+        history_columns = {row[1] for row in await cursor.fetchall()}
+        if "source" not in history_columns:
+            await db.execute("ALTER TABLE signal_history ADD COLUMN source TEXT")
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signal_history_symbol_source_id
+            ON signal_history (symbol, source, id)
         """)
         # کاربران مسدودشده توسط ادمین
         await db.execute("""
@@ -137,7 +154,148 @@ async def init_db():
                 auto_enabled INTEGER DEFAULT 0
             )
         """)
+        # دفتر ارسال خبر خودکار؛ سوابق قبلی قابل حدس نیستند و backfill ندارند.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS news_delivery (
+                user_id INTEGER NOT NULL,
+                news_key TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('reserved', 'sent')),
+                claim_token TEXT,
+                lease_until REAL,
+                sent_at TEXT,
+                PRIMARY KEY (user_id, news_key),
+                CHECK (
+                    (status = 'reserved' AND claim_token IS NOT NULL
+                     AND lease_until IS NOT NULL AND sent_at IS NULL)
+                    OR (status = 'sent' AND sent_at IS NOT NULL)
+                )
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_news_delivery_reserved_claim
+            ON news_delivery (user_id, claim_token) WHERE status = 'reserved'
+        """)
         await db.commit()
+
+
+def _validated_news_delivery_keys(user_id, news_keys) -> list[str]:
+    if type(user_id) is not int or not 0 < user_id <= 9223372036854775807:
+        raise ValueError("Invalid news delivery user")
+    if not isinstance(news_keys, (list, tuple)) or len(news_keys) > 50:
+        raise ValueError("Invalid news delivery keys")
+    if any(not isinstance(key, str) or len(key) != 64
+           or any(character not in "0123456789abcdef" for character in key)
+           for key in news_keys):
+        raise ValueError("Invalid news identity")
+    return list(dict.fromkeys(news_keys))
+
+
+def _validated_news_delivery_claim(user_id, token, news_keys) -> list[str]:
+    keys = _validated_news_delivery_keys(user_id, news_keys)
+    if (not isinstance(token, str) or len(token) != 32
+            or any(character not in "0123456789abcdef" for character in token)
+            or not keys or len(keys) > 3):
+        raise ValueError("Invalid news delivery claim")
+    return keys
+
+
+async def claim_news_delivery(user_id: int, news_keys, *, limit: int = 3) -> dict | None:
+    """Atomic per-user reservation; expired unsent claims can be retried."""
+    keys = _validated_news_delivery_keys(user_id, news_keys)
+    if type(limit) is not int or not 1 <= limit <= 3:
+        raise ValueError("Invalid news batch limit")
+    if not keys:
+        return None
+    async with aiosqlite.connect(DB_PATH) as connection:
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            now = datetime.now(timezone.utc).timestamp()  # after acquiring the lock
+            token = uuid.uuid4().hex
+            selected = []
+            for key in keys:
+                cursor = await connection.execute("""
+                    INSERT INTO news_delivery
+                        (user_id, news_key, status, claim_token, lease_until, sent_at)
+                    VALUES (?, ?, 'reserved', ?, ?, NULL)
+                    ON CONFLICT(user_id, news_key) DO UPDATE SET
+                        claim_token=excluded.claim_token,
+                        lease_until=excluded.lease_until
+                    WHERE news_delivery.status='reserved'
+                        AND news_delivery.sent_at IS NULL
+                        AND news_delivery.lease_until <= ?
+                """, (user_id, key, token, now + NEWS_DELIVERY_LEASE_SECONDS, now))
+                if cursor.rowcount == 1:
+                    selected.append(key)
+                if len(selected) == limit:
+                    break
+            if not selected:
+                await connection.rollback()
+                return None
+            await connection.commit()
+            return {"token": token, "news_keys": selected}
+        except BaseException:
+            await connection.rollback()
+            raise
+
+
+async def is_news_delivery_claim_current(user_id: int, token: str, news_keys) -> bool:
+    """Reject expired/replaced/partial claims before network sending."""
+    keys = _validated_news_delivery_claim(user_id, token, news_keys)
+    async with aiosqlite.connect(DB_PATH) as connection:
+        cursor = await connection.execute("""
+            SELECT news_key, lease_until FROM news_delivery
+            WHERE user_id=? AND claim_token=? AND status='reserved'
+        """, (user_id, token))
+        rows = await cursor.fetchall()
+    now = datetime.now(timezone.utc).timestamp()
+    return (set(row[0] for row in rows) == set(keys)
+            and all(isinstance(row[1], (int, float)) and math.isfinite(row[1])
+                    and row[1] > now for row in rows))
+
+
+async def _finish_news_delivery(user_id: int, token: str, news_keys, *, sent: bool) -> bool:
+    """Commit or release the complete owned batch; never touch another owner."""
+    keys = _validated_news_delivery_claim(user_id, token, news_keys)
+    async with aiosqlite.connect(DB_PATH) as connection:
+        try:
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute("""
+                SELECT news_key FROM news_delivery
+                WHERE user_id=? AND claim_token=? AND status='reserved'
+            """, (user_id, token))
+            rows = await cursor.fetchall()
+            if set(row[0] for row in rows) != set(keys):
+                await connection.rollback()
+                return False
+            if sent:
+                # Success can be recorded after expiry if no other owner reclaimed.
+                cursor = await connection.execute("""
+                    UPDATE news_delivery SET status='sent', sent_at=?,
+                        claim_token=NULL, lease_until=NULL
+                    WHERE user_id=? AND claim_token=? AND status='reserved'
+                """, (datetime.now(timezone.utc).isoformat(), user_id, token))
+            else:
+                cursor = await connection.execute("""
+                    DELETE FROM news_delivery
+                    WHERE user_id=? AND claim_token=? AND status='reserved'
+                """, (user_id, token))
+            if cursor.rowcount != len(keys):
+                raise aiosqlite.IntegrityError("Incomplete news delivery transition")
+            await connection.commit()
+            return True
+        except BaseException:
+            await connection.rollback()
+            raise
+
+
+async def mark_news_delivery_sent(user_id: int, token: str, news_keys) -> bool:
+    """Call only after Telegram returned success; not a read receipt."""
+    return await _finish_news_delivery(user_id, token, news_keys, sent=True)
+
+
+async def release_news_delivery_claim(user_id: int, token: str, news_keys) -> bool:
+    """Known failed/abandoned attempt may be retried; stale owners cannot release."""
+    return await _finish_news_delivery(user_id, token, news_keys, sent=False)
 
 
 async def add_user(user_id: int, username: str) -> bool:
@@ -221,22 +379,36 @@ async def set_auto_scan(user_id: int, enabled: bool):
         await db.commit()
 
 
-async def log_signal(symbol: str, signal_type: str, score: int, price: float):
+async def log_signal(symbol: str, signal_type: str, score: int, price: float, *, source: str):
+    """ثبت جدید فقط با منبع صریح؛ امتیاز و نوع سیگنال بازتفسیر نمی‌شوند."""
+    if not isinstance(source, str) or source not in SIGNAL_HISTORY_SOURCES:
+        raise ValueError("Unknown signal history source")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO signal_history (symbol, signal_type, score, price, created_at) VALUES (?, ?, ?, ?, ?)",
-            (symbol, signal_type, score, price, datetime.utcnow().isoformat())
+            """INSERT INTO signal_history (symbol, signal_type, score, price, created_at, source)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (symbol, signal_type, score, price, datetime.utcnow().isoformat(), source)
         )
         await db.commit()
 
 
-async def get_last_signal(symbol: str) -> dict | None:
-    """آخرین سیگنال ثبت‌شده برای یه نماد - برای جلوگیری از اسپم سیگنال تکراری"""
+async def get_last_signal(symbol: str, *, source: str | None = None) -> dict | None:
+    """
+    آخرین رکورد نماد در یک موتور؛ NULLهای قدیمی در خواندن منبع‌دار نیستند.
+    source=None خواندن تجمیعیِ سازگار است، نه مبنای تشخیص تغییر در اسکن.
+    """
+    if source is not None and (
+        not isinstance(source, str) or source not in SIGNAL_HISTORY_SOURCES
+    ):
+        raise ValueError("Unknown signal history source")
+    query = "SELECT signal_type, score, created_at FROM signal_history WHERE symbol = ?"
+    params = (symbol,)
+    if source is not None:
+        query += " AND source = ?"
+        params += (source,)
+    query += " ORDER BY id DESC LIMIT 1"
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT signal_type, score, created_at FROM signal_history WHERE symbol = ? ORDER BY id DESC LIMIT 1",
-            (symbol,)
-        )
+        cursor = await db.execute(query, params)
         row = await cursor.fetchone()
         if row:
             return {"signal_type": row[0], "score": row[1], "created_at": row[2]}

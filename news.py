@@ -9,8 +9,12 @@ import re
 import time
 import logging
 import email.utils
+import hashlib
+import json
+import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 # فقط اخبار امروز (از ۰۰:۰۰ امروز به وقت تهران) — نه ۲۴ ساعت گذشته
@@ -94,6 +98,73 @@ def _parse_forex_date(date_str: str, time_str: str) -> datetime | None:
         except ValueError:
             continue
     return dt_date.replace(tzinfo=timezone.utc)
+
+def _news_identity_text(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(unicodedata.normalize("NFKC", value).split()).casefold()
+
+
+def _news_identity_url(value: str) -> str | None:
+    """Conservative URL normalization; meaningful/repeated query order is kept."""
+    value = value.strip()
+    if any(character.isspace() for character in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        if (parts.scheme.lower() not in ("http", "https") or not parts.hostname
+                or parts.username is not None or parts.password is not None):
+            return None
+        port = parts.port  # also validates malformed ports
+        host = parts.hostname.lower()
+        if ":" in host:
+            host = f"[{host}]"
+        if port is not None and (parts.scheme.lower(), port) not in (("http", 80), ("https", 443)):
+            host += f":{port}"
+        tracking = {"fbclid", "gclid", "mc_cid", "mc_eid", "mkt_tok"}
+        query = [(key, item) for key, item in parse_qsl(parts.query, keep_blank_values=True)
+                 if not key.casefold().startswith("utm_") and key.casefold() not in tracking]
+        return urlunsplit((parts.scheme.lower(), host, parts.path or "/", urlencode(query), ""))
+    except ValueError:
+        return None
+
+
+def news_item_key(item) -> str | None:
+    """
+    Versioned SHA256 identity, independent of Python hash seed/impact/translation.
+    ForexFactory's shared calendar URL is NOT a unique event ID.
+    """
+    if not isinstance(item, dict):
+        return None
+    source = _news_identity_text(item.get("source"))
+    title = _news_identity_text(item.get("title"))
+    pubdate = item.get("pubDate")
+    date_text = _news_identity_text(pubdate)
+    if source == "forexfactory" or item.get("category") == "فارکس":
+        country = _news_identity_text(item.get("country"))
+        if not (source and title and country and date_text):
+            return None
+        parts = pubdate.strip().split(maxsplit=1)
+        parsed = _parse_forex_date(parts[0], parts[1] if len(parts) > 1 else "")
+        event_time = parsed.astimezone(timezone.utc).isoformat() if parsed else date_text
+        identity = ["calendar", source, country, title, event_time]
+    else:
+        link = item.get("link")
+        if link is not None and not isinstance(link, str):
+            return None
+        if isinstance(link, str) and link.strip():
+            canonical = _news_identity_url(link)
+            if canonical is None:
+                return None
+            identity = ["article-url", canonical]
+        else:
+            if not (source and title and date_text):
+                return None
+            parsed = _parse_pubdate(pubdate)
+            event_time = parsed.astimezone(timezone.utc).isoformat() if parsed else date_text
+            identity = ["article-fallback", source, title, event_time]
+    payload = json.dumps(["news-v1", *identity], ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 # --- دیکشنری ترجمه کلمات کلیدی به فارسی ---
 KEYWORD_FA = {
