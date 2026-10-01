@@ -42,7 +42,7 @@ def _result_keyboard(symbol: str, timeframe: str, pending_id: int = None) -> Inl
     buttons = [
         [
             InlineKeyboardButton("🔄 بروزرسانی", callback_data=f"tf:{symbol}:{timeframe}"),
-            InlineKeyboardButton("⏱ تقییر تایم‌فریم", callback_data=f"chtf:{symbol}"),
+            InlineKeyboardButton("⏱ تغییر تایم‌فریم", callback_data=f"chtf:{symbol}"),
         ],
         [
             InlineKeyboardButton("⭐ افزودن به واچ‌لیست", callback_data=f"watch:{symbol}"),
@@ -145,7 +145,7 @@ def _format_single_result(result, higher_tf_info: dict = None, btc_corr_info: di
         "",
         f"💰 قیمت فعلی: ${_fmt_price(result.price)}",
         f"💧 نقدینگی (۲۴س): ${result.quote_volume_24h:,.0f} — {result.liquidity_level}",
-        f"{change_arrow} تفییر ۲۴ساعته: {result.price_change_24h_percent:+.2f}%",
+        f"{change_arrow} تغییر ۲۴ساعته: {result.price_change_24h_percent:+.2f}%",
         "",
         "📊 اندیکاتورها:",
         f"• RSI: {result.rsi:.2f}",
@@ -290,13 +290,13 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
             warn_text = (
                 f"⚠️ برای `{symbol}` روی تایم‌فریم {tf_label} فقط {len(df)} کندل تاریخچه "
                 f"در دسترسه (حداقل {MIN_CANDLES_REQUIRED} تا لازمه تا اندیکاتورها معتبر باشن).\n\n"
-                f"یه تایم‌فریم کوچیک‌تر امتحان کن یا از «⏱ تقییر تایم‌فریم» استفاده کن."
+                f"یه تایم‌فریم کوچیک‌تر امتحان کن یا از «⏱ تغییر تایم‌فریم» استفاده کن."
             )
             return warn_text, None, None
 
         df = add_extended_indicators(df)
 
-        # تنظیمات قابل تفییر از پنل وب (اگه ادمین چیزی تفییر نداده باشه، مقادیر پیش‌فرض استفاده می‌شن)
+        # تنظیمات قابل تغییر از پنل وب (اگه ادمین چیزی تغییر نداده باشه، مقادیر پیش‌فرض استفاده می‌شن)
         confidence_threshold = await db.get_float_setting("confidence_threshold_fraction", 0.25)
         atr_sl_mult = await db.get_float_setting("atr_sl_mult", 1.5)
         rr_targets_raw = await db.get_setting("rr_targets")
@@ -431,7 +431,7 @@ def _classify_liquidity(quote_volume_24h: float) -> str:
         return "بالا 🟢"
     if quote_volume_24h >= 5_000_000:
         return "متوسط 🟡"
-    return "پایین 🔴 (ریسک اسپرد/لقزش قیمت بیشتر)"
+    return "پایین 🔴 (ریسک اسپرد/لغزش قیمت بیشتر)"
 
 
 # ---------- دستورات ----------

@@ -1,8 +1,34 @@
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import database as db
 import analytics
+
+try:
+    MONITOR_DISPLAY_TZ = ZoneInfo("Asia/Tehran")
+except ZoneInfoNotFoundError:
+    MONITOR_DISPLAY_TZ = timezone(timedelta(hours=3, minutes=30))
+
+
+def _format_monitor_datetime(value, *, date_only: bool = False) -> str:
+    """Display stored UTC/offset instants in Tehran; never rewrite stored metadata."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "ثبت نشده"
+    if not isinstance(value, str):
+        return "زمان ثبت‌شده قابل خواندن نیست"
+    raw = value.strip()
+    try:
+        moment = datetime.fromisoformat(raw)
+        if not date_only and "T" not in raw and " " not in raw:
+            return "ساعت دقیق ثبت نشده"
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        local = moment.astimezone(MONITOR_DISPLAY_TZ)
+        return local.strftime("%Y-%m-%d" if date_only else "%Y-%m-%d ساعت %H:%M:%S")
+    except (ValueError, TypeError, OverflowError):
+        return "زمان ثبت‌شده قابل خواندن نیست"
 
 
 async def setrisk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -153,12 +179,15 @@ async def mysignals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{emoji} *{sig['symbol']}* ({sig['timeframe']}) — {sig['direction']}\n"
             f"Entry برنامه‌ریزی‌شده: `{sig['entry']:,.4f}` | SL: `{sig['sl']:,.4f}`\n"
             f"وضعیت: {status_text}\n"
-            f"ثبت‌شده: {sig['created_at'][:10]}"
+            f"ثبت‌شده (وقت تهران): {_format_monitor_datetime(sig['created_at'], date_only=True)}"
         )
         if sig["entry_triggered_at"] is not None:
+            observed_price = sig["entry_observed_price"]
+            observed_text = (f"`{observed_price:,.4f}`" if db.is_valid_price(observed_price)
+                             else "ثبت نشده یا نامعتبر")
             text += (
-                f"\nفعال‌سازی فرضی در UTC: {sig['entry_triggered_at']}"
-                f"\nقیمت مشاهده‌شده: `{sig['entry_observed_price']:,.4f}`"
+                f"\nفعال‌سازی فرضی (وقت تهران): {_format_monitor_datetime(sig['entry_triggered_at'])}"
+                f"\nقیمت مشاهده‌شده: {observed_text}"
                 "\nاین ثبت، تأیید اجرای سفارش واقعی نیست."
             )
         elif sig["status"] != "WAITING_ENTRY":
