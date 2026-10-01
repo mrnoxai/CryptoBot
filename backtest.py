@@ -11,6 +11,8 @@ df.iloc[:i+1] استفاده می‌شه، یعنی موتور اصلاً نمی
 - اگه سیگنال قطعی (BUY/SELL) بود، فرض می‌کنیم ورود در کندل بعدی (i+1)
   با قیمت باز شدنش (Open) انجام می‌شه - این روش استاندارد و محافظه‌کارانه‌ست
   (نه با قیمت دقیق پیشنهادی که ممکنه اصلاً پر نشه)
+- قیمت ورود باید بین SL و TP1 باقی بماند؛ گپ نامعتبر با علت در
+  skipped_entries ثبت می‌شود، نه به‌عنوان برد/باخت یا معاملهٔ باز
 - بعد کندل‌به‌کندل جلو می‌ریم تا ببینیم اول به SL می‌خوریم یا به TP ها
 - تا وقتی این معامله باز نشده، سیگنال جدید حساب نمی‌کنیم (بدون هم‌پوشانی)
 
@@ -19,9 +21,13 @@ df.iloc[:i+1] استفاده می‌شه، یعنی موتور اصلاً نمی
 فرض می‌کنیم - یعنی بک‌تست به‌جای خوش‌بینانه، بدبینانه/محافظه‌کارانه‌ست.
 """
 from dataclasses import dataclass, field
+from collections import Counter
+from numbers import Real
+import math
 import pandas as pd
 
 from single_analysis import add_extended_indicators, build_single_result
+from trade_validation import TradeGeometryError, validate_trade_geometry
 
 DEFAULT_WARMUP_CANDLES = 60      # قبل از این تعداد کندل، اندیکاتورها (مخصوصاً SMA50) هنوز معتبر نیستن
 DEFAULT_MAX_HOLD_CANDLES = 60    # حداکثر تعداد کندلی که یه معامله باز می‌مونه قبل از timeout
@@ -46,6 +52,21 @@ class BacktestTrade:
 
 
 @dataclass
+class BacktestSkippedEntry:
+    """An attempted entry, not a win/loss/open trade; indices are local to its run."""
+    signal_index: int
+    entry_index: int
+    signal_time: object
+    entry_time: object
+    direction: object
+    planned_entry: object
+    actual_entry: object
+    sl: object
+    tps: object
+    reason: str
+
+
+@dataclass
 class BacktestResult:
     symbol: str
     timeframe: str
@@ -53,6 +74,15 @@ class BacktestResult:
     date_from: object
     date_to: object
     trades: list = field(default_factory=list)
+    skipped_entries: list = field(default_factory=list)
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped_entries)
+
+    @property
+    def skipped_reason_counts(self) -> dict:
+        return dict(Counter(entry.reason for entry in self.skipped_entries))
 
     @property
     def resolved_trades(self) -> list:
@@ -177,31 +207,82 @@ def run_backtest(
     """
     df باید کندل‌های خام (بدون اندیکاتور) و مرتب‌شده بر اساس زمان باشه.
     اندیکاتورها یه‌بار این‌جا (وکتایرایز، سریع) محاسبه می‌شن.
+    فقط هندسهٔ معتبر در open کندل بعد شبیه‌سازی می‌شود؛ ردشدگی جدا گزارش
+    می‌شود و به‌جای ورود واقعی سفارش یا اعتبارسنجی کامل OHLC نیست.
     """
     df = add_extended_indicators(df.copy()).reset_index(drop=True)
     n = len(df)
     trades = []
+    skipped_entries = []
+
+    def reject_entry(reason, signal_index, entry_index, proposal=None, actual_entry=None):
+        targets = getattr(proposal, "tps", None)
+        skipped_entries.append(BacktestSkippedEntry(
+            signal_index=signal_index, entry_index=entry_index,
+            signal_time=df.iloc[signal_index]["timestamp"],
+            entry_time=df.iloc[entry_index]["timestamp"],
+            direction=getattr(proposal, "direction", None),
+            planned_entry=getattr(proposal, "entry", None), actual_entry=actual_entry,
+            sl=getattr(proposal, "sl", None),
+            tps=tuple(targets) if isinstance(targets, (list, tuple)) else None,
+            reason=reason,
+        ))
 
     i = warmup
     while i < n - 1:
         sub_df = df.iloc[:i + 1]
-        result = build_single_result(
-            sub_df, symbol, timeframe,
-            confidence_threshold_fraction=confidence_threshold_fraction,
-            atr_sl_mult=atr_sl_mult, rr_targets=rr_targets,
-        )
-
-        if result.direction == "NEUTRAL" or not result.tps or result.sl is None:
+        entry_idx = i + 1
+        try:
+            result = build_single_result(
+                sub_df, symbol, timeframe,
+                confidence_threshold_fraction=confidence_threshold_fraction,
+                atr_sl_mult=atr_sl_mult, rr_targets=rr_targets,
+            )
+        except TradeGeometryError:
+            reject_entry("INVALID_SIGNAL_LEVELS", i, entry_idx)
             i += 1
             continue
 
-        entry_idx = i + 1
-        if entry_idx >= n:
-            break
+        if result.direction == "NEUTRAL":
+            i += 1
+            continue
 
-        entry_price = float(df.iloc[entry_idx]["open"])
+        try:
+            _, stop_price, targets = validate_trade_geometry(
+                result.direction, result.entry, result.sl, result.tps
+            )
+        except TradeGeometryError:
+            reject_entry("INVALID_SIGNAL_LEVELS", i, entry_idx, result)
+            i += 1
+            continue
+
+        # Read the column directly, retaining bool/text types rather than coercing them.
+        raw_entry = df["open"].iloc[entry_idx]
+        try:
+            entry_price = float(raw_entry) if isinstance(raw_entry, Real) and not isinstance(raw_entry, bool) else None
+        except (TypeError, ValueError, OverflowError):
+            entry_price = None
+        rejection = None
+        if entry_price is None or not math.isfinite(entry_price) or entry_price <= 0:
+            rejection = "INVALID_ENTRY_PRICE"
+        elif ((result.direction == "BUY" and entry_price <= stop_price)
+              or (result.direction == "SELL" and entry_price >= stop_price)):
+            rejection = "ENTRY_AT_OR_BEYOND_SL"
+        elif ((result.direction == "BUY" and entry_price >= targets[0])
+              or (result.direction == "SELL" and entry_price <= targets[0])):
+            rejection = "ENTRY_AT_OR_BEYOND_TP1"
+        else:
+            try:
+                validate_trade_geometry(result.direction, entry_price, stop_price, targets)
+            except TradeGeometryError:
+                rejection = "INVALID_ACTUAL_GEOMETRY"
+        if rejection is not None:
+            reject_entry(rejection, i, entry_idx, result, raw_entry)
+            i += 1  # No trade opened: do not consume a simulated holding period.
+            continue
+
         r, reason, exit_price, exit_time, exit_idx = _simulate_trade(
-            df, entry_idx, result.direction, entry_price, result.sl, result.tps, max_hold
+            df, entry_idx, result.direction, entry_price, stop_price, list(targets), max_hold
         )
 
         trades.append(BacktestTrade(
@@ -210,8 +291,8 @@ def run_backtest(
             exit_time=exit_time,
             direction=result.direction,
             entry=entry_price,
-            sl=result.sl,
-            tps=result.tps,
+            sl=stop_price,
+            tps=list(targets),
             exit_price=exit_price,
             exit_reason=reason,
             r_multiple=round(r, 3),
@@ -228,6 +309,7 @@ def run_backtest(
         date_from=df.iloc[0]["timestamp"] if n else None,
         date_to=df.iloc[-1]["timestamp"] if n else None,
         trades=trades,
+        skipped_entries=skipped_entries,
     )
 
 
@@ -302,6 +384,8 @@ class CalibrationCandidate:
     win_rate_spread: object
     composite_score: object
     reliable: bool
+    skipped_count: int = 0
+    skipped_reason_counts: dict = field(default_factory=dict)
 
 
 def evaluate_calibration_candidate(
@@ -317,6 +401,8 @@ def evaluate_calibration_candidate(
     """
     all_resolved_trades = []
     segment_win_rates = []
+    skipped_count = 0
+    skipped_reasons = Counter()
 
     for symbol, timeframe, df in symbol_dfs:
         try:
@@ -330,6 +416,8 @@ def evaluate_calibration_candidate(
 
         for r in results:
             all_resolved_trades.extend(r.resolved_trades)
+            skipped_count += r.skipped_count
+            skipped_reasons.update(r.skipped_reason_counts)
             if r.win_rate is not None:
                 segment_win_rates.append(r.win_rate)
 
@@ -367,6 +455,8 @@ def evaluate_calibration_candidate(
         win_rate_spread=win_rate_spread,
         composite_score=composite_score,
         reliable=reliable,
+        skipped_count=skipped_count,
+        skipped_reason_counts=dict(skipped_reasons),
     )
 
 

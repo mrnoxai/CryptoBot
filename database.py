@@ -9,6 +9,7 @@ import math
 import uuid
 from datetime import datetime, timedelta, timezone
 from config import DB_PATH
+from trade_validation import validate_trade_geometry
 
 logger = logging.getLogger(__name__)
 MONITOR_QUEUE_STATE_KEY = "_signal_performance_queue"
@@ -597,17 +598,8 @@ def is_valid_price(price) -> bool:
 async def _insert_signal_performance(connection, user_id: int, symbol: str, timeframe: str,
                                      direction: str, entry: float, sl: float, tps: list) -> int:
     """درج بدون commit؛ مالک تراکنش، ثبت و rollback را کنترل می‌کند."""
-    if (
-        direction not in ("BUY", "SELL")
-        or not is_valid_price(entry)
-        or not is_valid_price(sl)
-        or (direction == "BUY" and sl >= entry)
-        or (direction == "SELL" and sl <= entry)
-    ):
-        raise ValueError("Invalid direction, entry or stop-loss geometry")
-    tp1 = tps[0] if len(tps) > 0 else None
-    tp2 = tps[1] if len(tps) > 1 else None
-    tp3 = tps[2] if len(tps) > 2 else None
+    entry, sl, targets = validate_trade_geometry(direction, entry, sl, tps)
+    tp1, tp2, tp3 = targets
     cursor = await connection.execute(
         """INSERT INTO signal_performance
            (user_id, symbol, timeframe, direction, entry, sl, tp1, tp2, tp3, status, created_at)
@@ -620,6 +612,7 @@ async def _insert_signal_performance(connection, user_id: int, symbol: str, time
 async def record_signal_performance(user_id: int, symbol: str, timeframe: str, direction: str,
                                      entry: float, sl: float, tps: list) -> int:
     """ثبت مستقل در انتظار ورود؛ تایید pending باید از decide_pending_signal بگذرد."""
+    entry, sl, tps = validate_trade_geometry(direction, entry, sl, tps)
     async with aiosqlite.connect(DB_PATH) as connection:
         perf_id = await _insert_signal_performance(
             connection, user_id, symbol, timeframe, direction, entry, sl, tps
@@ -957,9 +950,8 @@ async def create_pending_signal(user_id: int, symbol: str, timeframe: str, direc
     قبل از ثبت قطعی یه سیگنال برای پایش، اول اینجا به‌صورت موقت ذخیره
     می‌شه تا از کاربر تاییدیه گرفته بشه. آی‌دی ردیف رو برمی‌گردونه.
     """
-    tp1 = tps[0] if len(tps) > 0 else None
-    tp2 = tps[1] if len(tps) > 1 else None
-    tp3 = tps[2] if len(tps) > 2 else None
+    entry, sl, targets = validate_trade_geometry(direction, entry, sl, tps)
+    tp1, tp2, tp3 = targets
     async with aiosqlite.connect(DB_PATH) as db:
         # پاکسازی سبک، نه مرجع اعتبار تایید. datetime هر دو طرف را به UTC
         # نرمال می‌کند؛ مقایسه‌ی سخت‌گیرانه ممکن است حذف را کمتر از یک ثانیه

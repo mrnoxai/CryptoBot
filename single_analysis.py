@@ -57,6 +57,7 @@
 """
 from dataclasses import dataclass, field
 import pandas as pd
+from trade_validation import validate_signal_output
 
 SWING_LOOKBACK = 20          # تعداد کندل برای تشخیص آخرین سقف/کف
 ATR_SL_MULT = 1.5            # ضریب پیش‌فرض ATR برای حد ضرر
@@ -469,6 +470,8 @@ def _calc_levels(df: pd.DataFrame, price: float, atr: float, direction: str, ema
     else:
         entry, entry_basis, sl, sl_basis, tps, risk = price, None, None, None, [], None
 
+    # Validate output without changing score, direction, level formulas or target order.
+    validate_signal_output(direction, price, entry, sl, tps)
     fib_confirmation = None
     if sl is not None:
         fib_confirmation = _calc_fibonacci_confirmation(swing_low, swing_high, sl, atr)
