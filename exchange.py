@@ -5,6 +5,7 @@
 import ccxt.async_support as ccxt
 import pandas as pd
 from config import EXCHANGE_ID
+from market_data_validation import ohlcv_frame_from_raw
 
 
 class ExchangeClient:
@@ -19,19 +20,12 @@ class ExchangeClient:
         """
         دریافت کندل‌ها و تبدیل به DataFrame
         ستون‌ها: timestamp, open, high, low, close, volume
-        پاکسازی دفاعی: مرتب‌سازی زمانی، حذف ردیف‌های تکراری/نامعتبر، و
-        محدود کردن به آخرین `limit` کندل معتبر - تا یه ردیف خراب باعث
-        کش‌اومدن کل محور زمان نمودار نشه.
+        اعتبارسنجی سخت‌گیرانهٔ کل پاسخ؛ دادهٔ خراب، تکراری یا نامرتب
+        حذف یا اصلاح نمی‌شود و تحلیل با خطای کنترل‌شده متوقف می‌شود.
+        از پاسخ معتبر، حداکثر آخرین `limit` کندل انتخاب می‌شود.
         """
         raw = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-
-        df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
-        df = df[(df["high"] > 0) & (df["low"] > 0) & (df["close"] > 0)]
-        df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
-        df = df.tail(limit).reset_index(drop=True)
-        return df
+        return ohlcv_frame_from_raw(raw, limit=limit)
 
     async def fetch_ticker_price(self, symbol: str) -> float:
         ticker = await self.exchange.fetch_ticker(symbol)

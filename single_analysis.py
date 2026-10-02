@@ -58,6 +58,7 @@
 from dataclasses import dataclass, field
 import pandas as pd
 from trade_validation import validate_signal_output
+from market_data_validation import validate_ohlcv_frame
 
 SWING_LOOKBACK = 20          # تعداد کندل برای تشخیص آخرین سقف/کف
 ATR_SL_MULT = 1.5            # ضریب پیش‌فرض ATR برای حد ضرر
@@ -84,6 +85,7 @@ TIMEFRAME_LABELS_FA = {
 
 def add_extended_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """محاسبه‌ی همه‌ی اندیکاتورهای لازم برای موتور حرفه‌ای"""
+    validate_ohlcv_frame(df, min_candles=MIN_CANDLES_REQUIRED)
     from ta.momentum import RSIIndicator
     from ta.trend import MACD, EMAIndicator, SMAIndicator
     from ta.volatility import AverageTrueRange, BollingerBands

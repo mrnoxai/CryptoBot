@@ -3,6 +3,7 @@
 از کتابخونه‌ی ta استفاده می‌کنیم
 """
 import pandas as pd
+from market_data_validation import validate_ohlcv_frame
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, EMAIndicator
 from ta.volatility import BollingerBands
@@ -14,6 +15,9 @@ from config import (
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """تمام اندیکاتورها رو به دیتافریم اضافه می‌کنه و همون رو برمی‌گردونه"""
+    required = max(RSI_PERIOD, EMA_FAST, EMA_SLOW, BB_PERIOD,
+                   MACD_SLOW + MACD_SIGNAL - 1, 21)
+    validate_ohlcv_frame(df, min_candles=required)
     close = df["close"]
 
     # RSI
