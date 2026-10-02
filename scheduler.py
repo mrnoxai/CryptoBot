@@ -252,7 +252,7 @@ async def news_auto_job(app: Application):
                 candidates.setdefault(key, item)
         if not candidates:
             return
-        header = "🚨 *خبر فوری بازار (تاثیر خیلی بالا)*\n\n"
+        header = "🚨 *خبر یا رویداد مهم بازار — تأثیر تخمینی بالا*\n\n"
         for uid in user_ids:
             claim = None
             telegram_succeeded = False

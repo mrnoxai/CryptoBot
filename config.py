@@ -190,3 +190,8 @@ SECOND_HIGHER_TIMEFRAME_MAP = {
 
 CONTEXT_MULTI_TF_FULL_ALIGN_BONUS = 6
 CONTEXT_MULTI_TF_FULL_CONFLICT_PENALTY = 10
+
+# ترجمهٔ فقط عنوان اخبار بازار با Gemini (اختیاری؛ بدون کلید، عنوان اصلی می‌ماند)
+NEWS_TRANSLATION_ENABLED = os.getenv("NEWS_TRANSLATION_ENABLED", "true").lower() in ("1", "true", "yes")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+NEWS_TRANSLATION_MODEL = os.getenv("NEWS_TRANSLATION_MODEL", "gemini-3.5-flash-lite").strip()

@@ -1,9 +1,10 @@
 """
 ماژول اخبار تاثیرگذار بر کریپتو و فارکس — فارسی، با درصد تاثیر
-منابع کاملاً رایگان (بدون نیاز به API Key):
- - Crypto: RSS های CoinDesk + CoinTelegraph + CryptoPanic public
- - Forex: ForexFactory calendar (XML) + Investing calendar fallback
- - کش حافظه‌ای + محاسبه درصد تاثیر بر اساس کلمات کلیدی و اهمیت رویداد
+منابع داده: RSS های CoinDesk و CoinTelegraph و تقویم هفتگی ForexFactory.
+دریافت این داده‌ها کلید نمی‌خواهد؛ ترجمهٔ فقط عنوان اخبار با Gemini اختیاری
+است و به کلید API و دسترسی سرویس نیاز دارد. متن مقاله ترجمه/ارسال نمی‌شود.
+نمایش اخبار و تقویم جداست؛ ساعت‌های مشخص به وقت ایران هستند.
+امتیاز تأثیر همان برآورد قبلی است، نه احتمال یا میزان تغییر قیمت.
 """
 import re
 import time
@@ -16,6 +17,9 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
+from news_translation import translate_news_titles
+from news_presentation import (calendar_metadata, calendar_title, calendar_local_date,
+    article_datetime, related_topics, render_combined, render_calendar, render_brief)
 
 # فقط اخبار امروز (از ۰۰:۰۰ امروز به وقت تهران) — نه ۲۴ ساعت گذشته
 from zoneinfo import ZoneInfo
@@ -58,7 +62,7 @@ def _parse_pubdate(pubdate_str: str) -> datetime | None:
 
 def _is_today(pubdate_str: str) -> bool:
     """آیا خبر مال امروزه (از ۰۰:۰۰ امروز به وقت تهران)؟ اگه تاریخ قابل پارس نباشه، تازه فرض می‌شه"""
-    dt = _parse_pubdate(pubdate_str)
+    dt = article_datetime(pubdate_str)
     if dt is None:
         return True
     # تبدیل به وقت تهران و مقایسه تاریخ شمسی/میلادی همون روز
@@ -290,7 +294,7 @@ async def fetch_crypto_news(limit: int = 8, force: bool = False) -> list:
     if not force:
         cached = _cache_get("crypto_news", CACHE_TTL_NEWS)
         if cached is not None:
-            return cached[:limit]
+            return await translate_news_titles([item for item in cached if _is_today(item.get("pubDate", ""))][:limit])
     all_items = []
     for url, source, weight in CRYPTO_RSS:
         items = await _fetch_rss(url)
@@ -301,8 +305,10 @@ async def fetch_crypto_news(limit: int = 8, force: bool = False) -> list:
             pct = _calc_impact(it["title"], it["desc"], source_weight=weight)
             all_items.append({
                 "title": it["title"],
-                "title_fa": _translate_title(it["title"]),
-                "summary_fa": _to_persian_summary(it["title"], it["desc"]),
+                "title_fa": it["title"],
+                "translation_status": "native" if re.search(r"[\u0600-\u06ff]", it["title"]) else "original",
+                "related_to": related_topics(it["title"], it["desc"]),
+                "summary_fa": "",
                 "impact": pct,
                 "impact_label": _impact_label(pct),
                 "category": "کریپتو",
@@ -313,71 +319,69 @@ async def fetch_crypto_news(limit: int = 8, force: bool = False) -> list:
     # مرتب بر اساس تاثیر نزولی
     all_items.sort(key=lambda x: x["impact"], reverse=True)
     _cache_set("crypto_news", all_items)
-    return all_items[:limit]
+    return await translate_news_titles(all_items[:limit])
 
 # --- تقویم فارکس (ForexFactory) ---
-async def fetch_forex_calendar(limit: int = 8, force: bool = False) -> list:
-    if not force:
-        cached = _cache_get("forex_calendar", CACHE_TTL_CALENDAR)
-        if cached is not None:
-            return cached[:limit]
-    # ForexFactory weekly calendar XML
-    urls = [
-        "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
-        "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.xml",
-    ]
-    items = []
-    for url in urls:
-        try:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
-                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                if resp.status_code != 200:
-                    continue
-                root = ET.fromstring(resp.text)
-                for ev in root.findall(".//event"):
-                    title = (ev.findtext("title") or "").strip()
-                    country = (ev.findtext("country") or "").strip()
-                    date = (ev.findtext("date") or "").strip()
-                    time_e = (ev.findtext("time") or "").strip()
-                    impact = (ev.findtext("impact") or "").strip()  # High/Medium/Low
-                    forecast = (ev.findtext("forecast") or "").strip()
-                    previous = (ev.findtext("previous") or "").strip()
-                    if not title:
+async def fetch_forex_calendar(limit: int = 8, force: bool = False, day=None) -> list:
+    """Weekly UTC XML cache, filtered per requested Tehran day on every read.
+
+    Display times do not use the legacy parser kept for persistent identity.
+    Unknown clocks retain their status, never an invented midnight.
+    """
+    selected_day = day or datetime.now(TEHRAN_TZ).date()
+    cached = None if force else _cache_get("forex_calendar_v2", CACHE_TTL_CALENDAR)
+    if cached is None:
+        urls = ["https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
+                "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.xml"]
+        cached = []
+        for url in urls:
+            try:
+                async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, follow_redirects=True) as client:
+                    resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                    if resp.status_code != 200:
                         continue
-                    if country not in ("USD", "EUR", "GBP", "JPY", "CNY"):
-                        continue
-                    # فقط رویدادهای امروز (به وقت تهران)
-                    dt = _parse_forex_date(date, time_e)
-                    if dt is not None:
-                        dt_tehran = dt.astimezone(TEHRAN_TZ)
-                        now_tehran = datetime.now(TEHRAN_TZ)
-                        if dt_tehran.date() != now_tehran.date():
+                    root = ET.fromstring(resp.text)
+                    for ev in root.findall(".//event"):
+                        title = (ev.findtext("title") or "").strip()
+                        country = (ev.findtext("country") or "").strip()
+                        date = (ev.findtext("date") or "").strip()
+                        time_e = (ev.findtext("time") or "").strip()
+                        impact = (ev.findtext("impact") or "").strip()
+                        if not title or country not in ("USD", "EUR", "GBP", "JPY", "CNY"):
                             continue
-                    pct = _calc_impact(title, calendar_importance=impact, source_weight=45)
-                    # فقط تاثیر متوسط به بالا رو نشون بده (کم‌اهمیت‌ها نویزن)
-                    if pct < 35:
-                        continue
-                    items.append({
-                        "title": f"{country} - {title}",
-                        "title_fa": f"{country} - {_translate_title(title)}",
-                        "summary_fa": _to_persian_summary(title) + (f" (پیش‌بینی: {forecast} | قبلی: {previous})" if forecast or previous else ""),
-                        "impact": pct,
-                        "impact_label": _impact_label(pct),
-                        "category": "فارکس",
-                        "source": "ForexFactory",
-                        "link": "https://www.forexfactory.com/calendar",
-                        "pubDate": f"{date} {time_e}",
-                        "country": country,
-                        "raw_impact": impact,
-                    })
-                if items:
-                    break
-        except Exception as e:
-            logger.warning(f"Forex calendar fetch failed {url}: {e}")
-            continue
-    items.sort(key=lambda x: x["impact"], reverse=True)
-    _cache_set("forex_calendar", items)
-    return items[:limit]
+                        metadata = calendar_metadata(date, time_e)
+                        if metadata["event_date"] is None:
+                            continue
+                        pct = _calc_impact(title, calendar_importance=impact, source_weight=45)
+                        if pct < 35:
+                            continue
+                        translated, _ = calendar_title(title)
+                        cached.append({
+                            "title": f"{country} - {title}", "title_fa": translated,
+                            "event_title": title, "summary_fa": "",
+                            "impact": pct, "impact_label": _impact_label(pct),
+                            "category": "فارکس", "source": "ForexFactory",
+                            "link": "https://www.forexfactory.com/calendar",
+                            "pubDate": f"{date} {time_e}", "country": country,
+                            "raw_impact": impact,
+                            "forecast": (ev.findtext("forecast") or "").strip(),
+                            "previous": (ev.findtext("previous") or "").strip(),
+                            "actual": (ev.findtext("actual") or "").strip(),
+                            **metadata,
+                        })
+                    if cached:
+                        break
+            except Exception as error:
+                logger.warning("Calendar source failed: %s", type(error).__name__)
+        _cache_set("forex_calendar_v2", cached)
+    items = [item for item in cached if calendar_local_date(item) == selected_day]
+    if limit is None:
+        items.sort(key=lambda item: (item.get("event_time_utc") or "zz", -item["impact"]))
+    else:
+        # Preserve importance-based selection for existing auto/signal callers.
+        items.sort(key=lambda item: -item["impact"])
+    return items if limit is None else items[:limit]
+
 
 async def get_combined_news(crypto_limit: int = 6, forex_limit: int = 4, force: bool = False) -> list:
     """ترکیب اخبار کریپتو + تقویم فارکس، مرتب بر اساس تاثیر — اگه force=True کش نادیده گرفته می‌شه"""
@@ -388,33 +392,13 @@ async def get_combined_news(crypto_limit: int = 6, forex_limit: int = 4, force: 
     return combined
 
 def format_news_message(news_list: list, max_items: int = 8) -> str:
-    if not news_list:
-        return "📰 امروز هنوز خبر مهم جدیدی منتشر نشده. چند ساعت دیگه دوباره /news رو بزن."
-    lines = ["📰 *اخبار مهم امروز — تاثیرگذار بر بازار*\n"]
-    lines.append("_فقط اخبار امروز (از ۰۰:۰۰ به وقت تهران) — هر خبر با درصد تاثیر تخمینی_")
-    lines.append("")
-    for i, n in enumerate(news_list[:max_items], 1):
-        bar_len = max(1, n["impact"] // 10)
-        bar = "█" * bar_len + "░" * (10 - bar_len)
-        lines.append(f"*{i}. {n['title_fa']}*")
-        lines.append(f"{n['impact_label']} — *{n['impact']}%* `{bar}`")
-        lines.append(f"📂 {n['category']} | 📰 {n['source']}")
-        lines.append(f"📝 {n['summary_fa']}")
-        if n.get("link"):
-            lines.append(f"🔗 [منبع]({n['link']})")
-        lines.append("")
-    lines.append("⚠️ درصد تاثیر تخمینی و بر اساس تحلیل خودکاره — تصمیم نهایی با خودته. حد ضرر رو فراموش نکن.")
-    return "\n".join(lines)
+    """Manual market list or separate sections for legacy combined auto batches."""
+    return render_combined(news_list, max_items=max_items)
+
+
+def format_calendar_message(news_list: list, max_items: int = 12, day=None) -> str:
+    return render_calendar(news_list, max_items=max_items, day=day)
+
 
 def format_brief_for_signal(news_list: list, max_items: int = 2) -> str:
-    """خلاصه کوتاه برای چسبوندن زیر پیام /signal"""
-    if not news_list:
-        return ""
-    top = [n for n in news_list if n["impact"] >= 55][:max_items]
-    if not top:
-        return ""
-    lines = ["\n📰 *اخبار داغ مرتبط:*"]
-    for n in top:
-        lines.append(f"• {n['title_fa']} — {n['impact_label']} {n['impact']}%")
-    lines.append("_برای جزئیات: /news_")
-    return "\n".join(lines)
+    return render_brief(news_list, max_items=max_items)
