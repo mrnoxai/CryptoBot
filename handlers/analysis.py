@@ -273,6 +273,7 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
     خروجی/تارگت نامعتبر نیز فقط هشدار می‌دهد؛ تاریخچه و pending ثبت نمی‌شود.
     """
     from trade_validation import TradeGeometryError, validate_signal_output
+    from market_data_validation import MarketDataError, validate_ohlcv_frame, market_data_warning
     invalid_output_message = (
         "⚠️ خروجی سیگنال یا تنظیمات تارگت معتبر نیست.\n"
         "قیمت‌ها باید مثبت و متناهی و ترتیب Entry، SL و سه تارگت صحیح باشد.\n"
@@ -283,7 +284,11 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
         if not await client.validate_symbol(symbol):
             return None, None, None
 
-        df = await client.fetch_ohlcv_df(symbol, timeframe, limit=MIN_CANDLES_FOR_ANALYSIS)
+        try:
+            df = await client.fetch_ohlcv_df(symbol, timeframe, limit=MIN_CANDLES_FOR_ANALYSIS)
+            validate_ohlcv_frame(df)
+        except MarketDataError as error:
+            return market_data_warning(error), None, None
 
         if len(df) < MIN_CANDLES_REQUIRED:
             tf_label = TIMEFRAME_LABELS_FA.get(timeframe, timeframe)
@@ -294,7 +299,10 @@ async def run_single_timeframe_signal(symbol: str, timeframe: str, user_id: int 
             )
             return warn_text, None, None
 
-        df = add_extended_indicators(df)
+        try:
+            df = add_extended_indicators(df)
+        except MarketDataError as error:
+            return market_data_warning(error), None, None
 
         # تنظیمات قابل تغییر از پنل وب (اگه ادمین چیزی تغییر نداده باشه، مقادیر پیش‌فرض استفاده می‌شن)
         confidence_threshold = await db.get_float_setting("confidence_threshold_fraction", 0.25)
@@ -470,6 +478,7 @@ async def chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _send_basic_chart(message, symbol: str, timeframe: str):
+    from market_data_validation import MarketDataError, market_data_warning
     msg = await message.reply_text(f"⏳ در حال ساخت نمودار {symbol} ({timeframe})...")
     client = ExchangeClient()
     try:
@@ -481,6 +490,8 @@ async def _send_basic_chart(message, symbol: str, timeframe: str):
         chart_buf = generate_extended_chart(df, symbol, timeframe)
         await message.reply_photo(photo=chart_buf)
         await msg.delete()
+    except MarketDataError as error:
+        await msg.edit_text(market_data_warning(error))
     except Exception as e:
         await msg.edit_text(f"❌ خطا در ساخت نمودار: {e}")
     finally:
